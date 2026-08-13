@@ -5,8 +5,28 @@ use axum::http::{Request, StatusCode};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use serde_json::json;
+use sha2::{Digest, Sha256};
+use subtle::ConstantTimeEq;
 
 use super::state::AppState;
+
+/// Constant-time comparison of a presented bearer token against the expected
+/// value.
+///
+/// Both sides are hashed with SHA-256 before comparing, so:
+/// - the comparison takes the same time regardless of *where* the first
+///   difference occurs (no early-exit on a mismatching byte), and
+/// - the *length* of the expected token is not revealed (a length mismatch
+///   would otherwise return immediately, leaking information via timing).
+///
+/// The digest values are then compared with `subtle::ConstantTimeEq`, which
+/// compiles to a fixed sequence of XOR/OR operations with no data-dependent
+/// branches.
+fn tokens_equal(presented: &str, expected: &str) -> bool {
+    let presented_digest = Sha256::digest(presented.as_bytes());
+    let expected_digest = Sha256::digest(expected.as_bytes());
+    bool::from(presented_digest.ct_eq(&expected_digest))
+}
 
 /// Decide whether a `Host` header value is acceptable.
 ///
@@ -103,7 +123,7 @@ pub async fn bearer_auth(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|token| token == expected)
+        .map(|token| tokens_equal(token, expected))
         .unwrap_or(false);
 
     if authorized {
@@ -120,6 +140,35 @@ pub async fn bearer_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn equal_tokens_match() {
+        assert!(tokens_equal("secret-token", "secret-token"));
+        // Unicode content hashes deterministically too.
+        assert!(tokens_equal("你好-世界", "你好-世界"));
+    }
+
+    #[test]
+    fn different_tokens_do_not_match() {
+        assert!(!tokens_equal("secret-token", "secret-tokem"));
+        assert!(!tokens_equal("secret-token", "Secret-token"));
+        assert!(!tokens_equal("", "secret-token"));
+        assert!(!tokens_equal("secret-token", ""));
+    }
+
+    #[test]
+    fn tokens_of_different_length_do_not_match() {
+        // Length mismatch must still return false (constant-time hashing makes
+        // the comparison itself not reveal the length, but equality is false).
+        assert!(!tokens_equal("short", "a-much-longer-token"));
+        assert!(!tokens_equal("a-much-longer-token", "short"));
+    }
+
+    #[test]
+    fn empty_tokens_match_only_each_other() {
+        assert!(tokens_equal("", ""));
+        assert!(!tokens_equal("", "x"));
+    }
 
     #[test]
     fn loopback_literals_are_allowed() {

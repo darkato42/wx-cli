@@ -320,8 +320,15 @@ fn spawn_worker(
 
     command.arg("--worker-id").arg(worker_id);
 
+    // Secrets are passed via the environment, NOT argv: command-line arguments
+    // are visible to every local user via `ps` on macOS (no hidepid). The
+    // `--worker-id` argument intentionally stays in argv — it is the mechanism
+    // `pid_matches_managed_worker` uses to identify this worker in `ps`.
     if let Some(key) = &config.key {
-        command.arg("--key").arg(key);
+        command.env("WX_CLI_WORKER_KEY", key);
+    }
+    if let Some(token) = &config.token {
+        command.env("WX_CLI_WORKER_TOKEN", token);
     }
     if let Some(data_dir) = &config.data_dir {
         command.arg("--data-dir").arg(data_dir);
@@ -338,9 +345,6 @@ fn spawn_worker(
     command.arg("--poll-ms").arg(config.poll_ms.to_string());
     command.arg("--host").arg(&config.host);
     command.arg("--port").arg(config.port.to_string());
-    if let Some(token) = &config.token {
-        command.arg("--token").arg(token);
-    }
     if config.no_auth {
         command.arg("--no-auth");
     }

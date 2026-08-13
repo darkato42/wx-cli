@@ -5,10 +5,10 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wx_paths::AppPaths;
 
-use super::types::{ServerHealthPayload, ServerLaunchConfig, ServerRuntimeState};
+use super::types::{ServerHealthPayload, ServerLaunchConfig, ServerRuntimeState, ServerSecrets};
 
 pub struct ManagementLockGuard {
     lock_file: PathBuf,
@@ -84,17 +84,90 @@ pub fn save_runtime_state(
     save_json(&ap.server_state_file(), state)
 }
 
+/// Load the persisted launch config, re-attaching any secrets from the
+/// separate 0600 secrets file. When the secrets file is absent (upgrade from
+/// a version that stored secrets inline in config.json), falls back to the
+/// legacy inline fields so restart/status do not lose the key/token.
 pub fn load_launch_config(
     ap: &AppPaths,
 ) -> Result<Option<ServerLaunchConfig>, Box<dyn std::error::Error>> {
-    load_json(&ap.server_config_file())
+    let Some(mut config) = load_json::<ServerLaunchConfig>(&ap.server_config_file())? else {
+        return Ok(None);
+    };
+    if let Some(secrets) = load_json::<ServerSecrets>(&ap.server_secrets_file())? {
+        config.key = secrets.key;
+        config.token = secrets.token;
+    } else if let Some(legacy) = load_json::<LegacyLaunchConfig>(&ap.server_config_file())? {
+        // Pre-secrets-file configs stored key/token inline. `#[serde(skip)]`
+        // on ServerLaunchConfig ignores those fields during the normal
+        // deserialize above, so read them explicitly here.
+        config.key = legacy.key.or(config.key);
+        config.token = legacy.token.or(config.token);
+    }
+    Ok(Some(config))
 }
 
+/// Deserialization shape for launch configs written by versions that stored
+/// `key`/`token` inline in `config.json`. Used only as an upgrade fallback
+/// when `secrets.json` is missing; modern configs carry no secret fields.
+#[derive(Deserialize)]
+struct LegacyLaunchConfig {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
+}
+
+/// Persist the launch config. `key` and `token` are serialization-skipped on
+/// `ServerLaunchConfig`, so `config.json` holds no secrets; they are written to
+/// a sibling `secrets.json` created with mode 0600 (owner read/write only).
 pub fn save_launch_config(
     ap: &AppPaths,
     config: &ServerLaunchConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    save_json(&ap.server_config_file(), config)
+    save_json(&ap.server_config_file(), config)?;
+    save_secrets_file(
+        ap,
+        &ServerSecrets {
+            key: config.key.clone(),
+            token: config.token.clone(),
+        },
+    )
+}
+
+/// Write the secrets file with restrictive permissions. The temp file is
+/// created 0600 *before* writing so there is no 0644 window, and the final
+/// file is chmodded 0600 after rename as belt-and-braces.
+fn save_secrets_file(
+    ap: &AppPaths,
+    secrets: &ServerSecrets,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = ap.server_secrets_file();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temp = path.with_extension("json.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)?;
+        // `.mode(0o600)` only applies at creation: a stale temp left by a
+        // crashed earlier run keeps its old (possibly 0644) mode. Tighten
+        // right after open so secrets are never written into a permissive
+        // file, even mid-window before the rename.
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
+        file.write_all(&serde_json::to_vec_pretty(secrets)?)?;
+        file.flush()?;
+    }
+    fs::rename(&temp, &path)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 pub fn remove_runtime_state(ap: &AppPaths) -> Result<(), Box<dyn std::error::Error>> {

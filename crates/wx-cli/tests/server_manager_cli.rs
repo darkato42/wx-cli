@@ -1,21 +1,28 @@
 use std::fs;
+
 use std::path::{Path, PathBuf};
+
 use std::process::Command;
+
 use std::thread;
+
 use std::time::{Duration, Instant};
 
 use rusqlite::{params, Connection};
+
 use tempfile::TempDir;
 
 const TEST_KEY_HEX: &str = "abababababababababababababababababababababababababababababababab";
+
 const TEST_ACCOUNT_ID: &str = "wxid_test_account";
+
 const TALKER: &str = "wxid_alice";
+
 const MSG_TABLE: &str = "Msg_29a6db07e8bbdb53f5d54cc3c309f3f1";
 
 fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_wx-cli")
 }
-
 /// Worker logs can carry the auth token, so they must be 0600 — including
 /// when an older version already created them with broader permissions.
 #[test]
@@ -76,31 +83,90 @@ fn worker_logs_are_tightened_to_0600_even_if_preexisting() {
 }
 
 #[test]
-fn help_surface_exposes_server_group_only() {
-    let root_help = Command::new(bin())
-        .arg("--help")
-        .output()
-        .expect("run root help");
-    assert!(root_help.status.success(), "{root_help:?}");
-    let root_help = String::from_utf8_lossy(&root_help.stdout);
-    assert!(root_help.contains("server"));
-    assert!(!root_help.lines().any(|line| line.trim() == "serve"));
+fn launch_config_json_contains_no_secrets_and_secrets_file_is_0600() {
+    use std::os::unix::fs::OpenOptionsExt;
 
-    let server_help = Command::new(bin())
-        .args(["server", "--help"])
+    let fixture = create_fixture();
+    let runtime_root = fixture.path().join("runtime");
+    let _guard = ManagedServerGuard::new(runtime_root.clone());
+    let account_dir = fixture.path().join(TEST_ACCOUNT_ID);
+    let port = find_open_port();
+
+    // Crash-recovery scenario: a stale temp file left by an interrupted run
+    // with world-readable perms. save_secrets_file must tighten it before
+    // writing secrets into it (mode() applies only at creation).
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o644)
+        .open(runtime_root.join("secrets.json.tmp"))
+        .expect("pre-create permissive temp");
+
+    let run = Command::new(bin())
+        .args([
+            "server",
+            "run",
+            "--data-dir",
+            account_dir.to_str().expect("fixture path utf8"),
+            "--key",
+            TEST_KEY_HEX,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--poll",
+            "--poll-ms",
+            "1000",
+            "--runtime-root",
+            runtime_root.to_str().expect("runtime root utf8"),
+        ])
         .output()
-        .expect("run server help");
-    assert!(server_help.status.success(), "{server_help:?}");
-    let server_help = String::from_utf8_lossy(&server_help.stdout);
-    assert!(server_help.contains("run"));
-    assert!(server_help.contains("status"));
-    assert!(server_help.contains("stop"));
-    assert!(server_help.contains("restart"));
-    assert!(!server_help.contains("_worker"));
+        .expect("run server");
+    assert_runtime_success(&run, &runtime_root);
+
+    let config_path = runtime_root.join("config.json");
+    let config_text = fs::read_to_string(&config_path).expect("read config.json");
+    assert!(
+        !config_text.contains(TEST_KEY_HEX),
+        "config.json must not contain the raw key: {config_text}"
+    );
+    assert!(
+        !config_text.contains("token"),
+        "config.json must not contain any token field: {config_text}"
+    );
+
+    let secrets_path = runtime_root.join("secrets.json");
+    let secrets_text = fs::read_to_string(&secrets_path).expect("read secrets.json");
+    assert!(
+        secrets_text.contains(TEST_KEY_HEX),
+        "secrets.json should hold the key: {secrets_text}"
+    );
+    assert!(
+        secrets_text.contains("token"),
+        "secrets.json should hold the generated token: {secrets_text}"
+    );
+
+    use std::os::unix::fs::PermissionsExt;
+    let mode = fs::metadata(&secrets_path)
+        .expect("secrets metadata")
+        .permissions()
+        .mode();
+    // Owner read/write only — no group/world bits.
+    assert_eq!(mode & 0o777, 0o600, "secrets.json mode was {mode:o}");
+
+    // The temp file must not survive the save.
+    assert!(
+        !runtime_root.join("secrets.json.tmp").exists(),
+        "secrets.json.tmp should be renamed away"
+    );
 }
 
+/// On Linux, verify the worker's argv (what `ps` would show on macOS) carries
+/// no secrets. The manager must pass key/token via env, not arguments.
+#[cfg(target_os = "linux")]
 #[test]
-fn server_run_status_restart_and_stop_round_trip() {
+fn worker_argv_contains_no_key_or_token() {
     let fixture = create_fixture();
     let runtime_root = fixture.path().join("runtime");
     let _guard = ManagedServerGuard::new(runtime_root.clone());
@@ -130,11 +196,192 @@ fn server_run_status_restart_and_stop_round_trip() {
     assert_runtime_success(&run, &runtime_root);
 
     let status = server_status_json(&runtime_root);
+    let pid = status["pid"].as_u64().expect("pid in status");
+    let cmdline = fs::read(format!("/proc/{pid}/cmdline")).expect("read worker cmdline");
+    let argv: Vec<String> = cmdline
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
+    let joined = argv.join(" ");
+    // NOTE: the assertion messages deliberately do NOT include `joined` — if
+    // a regression reintroduces a secret into argv, printing it would leak the
+    // secret into CI logs.
+    assert!(
+        !joined.contains(TEST_KEY_HEX),
+        "worker argv must not contain the key"
+    );
+    assert!(
+        !joined.contains("--token") && !joined.contains("--key"),
+        "worker argv must not carry secrets via flags"
+    );
+    // The worker-id flag legitimately stays in argv (process identification).
+    assert!(
+        joined.contains("_worker"),
+        "worker argv should still identify the worker role"
+    );
+}
+
+/// Upgrade path: versions before the secrets split stored `key`/`token`
+/// inline in `config.json`. `load_launch_config` must fall back to those when
+/// `secrets.json` is absent, or restart/status would silently lose the key
+/// (the worker could no longer open the encrypted DB).
+#[test]
+fn legacy_inline_secrets_in_config_json_are_still_honored() {
+    let fixture = create_fixture();
+    let runtime_root = fixture.path().join("runtime");
+    let _guard = ManagedServerGuard::new(runtime_root.clone());
+    let account_dir = fixture.path().join(TEST_ACCOUNT_ID);
+    let port = find_open_port();
+
+    let run_args = [
+        "server",
+        "run",
+        "--data-dir",
+        account_dir.to_str().expect("fixture path utf8"),
+        "--key",
+        TEST_KEY_HEX,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+        "--poll",
+        "--poll-ms",
+        "1000",
+        "--runtime-root",
+        runtime_root.to_str().expect("runtime root utf8"),
+    ];
+
+    // First run writes the modern config.json + secrets.json and starts a worker.
+    let run = Command::new(bin())
+        .args(run_args.clone())
+        .output()
+        .expect("run server");
+    assert_runtime_success(&run, &runtime_root);
+
+    // Stop cleanly, then simulate an old installation: secrets.json removed
+    // and config.json rewritten with key/token inline (pre-secrets format).
+    let stop = Command::new(bin())
+        .args(["server", "stop", "--runtime-root"])
+        .arg(runtime_root.to_str().expect("runtime root utf8"))
+        .output()
+        .expect("stop server");
+    assert!(stop.status.success(), "stop failed: {stop:?}");
+    wait_for_pid_exit(
+        server_status_json(&runtime_root)["pid"]
+            .as_u64()
+            .unwrap_or(0) as u32,
+    );
+
+    let config_path = runtime_root.join("config.json");
+    let mut text = fs::read_to_string(&config_path).expect("read config.json");
+    text = text.replacen(
+        '{',
+        &format!(r#"{{"key": "{TEST_KEY_HEX}", "token": null,"#),
+        1,
+    );
+    fs::write(&config_path, text).expect("rewrite legacy config");
+    fs::remove_file(runtime_root.join("secrets.json")).expect("remove secrets.json");
+
+    // Restart without re-supplying --key: the key now has to come entirely
+    // from the persisted config. The legacy inline fallback must restore it,
+    // or the worker cannot open the encrypted DB and never becomes ready.
+    let restart = Command::new(bin())
+        .args([
+            "server",
+            "restart",
+            "--runtime-root",
+            runtime_root.to_str().expect("runtime root utf8"),
+        ])
+        .output()
+        .expect("restart server");
+    assert_runtime_success(&restart, &runtime_root);
+}
+
+#[test]
+
+fn help_surface_exposes_server_group_only() {
+    let root_help = Command::new(bin())
+        .arg("--help")
+        .output()
+        .expect("run root help");
+
+    assert!(root_help.status.success(), "{root_help:?}");
+
+    let root_help = String::from_utf8_lossy(&root_help.stdout);
+
+    assert!(root_help.contains("server"));
+
+    assert!(!root_help.lines().any(|line| line.trim() == "serve"));
+
+    let server_help = Command::new(bin())
+        .args(["server", "--help"])
+        .output()
+        .expect("run server help");
+
+    assert!(server_help.status.success(), "{server_help:?}");
+
+    let server_help = String::from_utf8_lossy(&server_help.stdout);
+
+    assert!(server_help.contains("run"));
+
+    assert!(server_help.contains("status"));
+
+    assert!(server_help.contains("stop"));
+
+    assert!(server_help.contains("restart"));
+
+    assert!(!server_help.contains("_worker"));
+}
+
+#[test]
+
+fn server_run_status_restart_and_stop_round_trip() {
+    let fixture = create_fixture();
+
+    let runtime_root = fixture.path().join("runtime");
+
+    let _guard = ManagedServerGuard::new(runtime_root.clone());
+
+    let account_dir = fixture.path().join(TEST_ACCOUNT_ID);
+
+    let port = find_open_port();
+
+    let run = Command::new(bin())
+        .args([
+            "server",
+            "run",
+            "--data-dir",
+            account_dir.to_str().expect("fixture path utf8"),
+            "--key",
+            TEST_KEY_HEX,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--poll",
+            "--poll-ms",
+            "1000",
+            "--runtime-root",
+            runtime_root.to_str().expect("runtime root utf8"),
+        ])
+        .output()
+        .expect("run server");
+
+    assert_runtime_success(&run, &runtime_root);
+
+    let status = server_status_json(&runtime_root);
+
     assert_eq!(status["status"], "running");
+
     assert_eq!(status["health"], "healthy");
+
     assert_eq!(status["ready"], true);
+
     assert_eq!(status["base_url"], format!("http://127.0.0.1:{port}"));
+
     assert!(status["pid"].as_u64().unwrap_or_default() > 0);
+
     assert!(status["cli_version"].as_str().is_some());
 
     let duplicate = Command::new(bin())
@@ -157,7 +404,9 @@ fn server_run_status_restart_and_stop_round_trip() {
         ])
         .output()
         .expect("run duplicate server");
+
     assert_runtime_success(&duplicate, &runtime_root);
+
     assert!(String::from_utf8_lossy(&duplicate.stdout).contains("already running"));
 
     let different_config = Command::new(bin())
@@ -180,11 +429,14 @@ fn server_run_status_restart_and_stop_round_trip() {
         ])
         .output()
         .expect("run duplicate server with different config");
+
     assert!(!different_config.status.success(), "{different_config:?}");
+
     assert!(String::from_utf8_lossy(&different_config.stderr)
         .contains("different launch configuration"));
 
     let unchanged = server_status_json(&runtime_root);
+
     assert_eq!(unchanged["base_url"], format!("http://127.0.0.1:{port}"));
 
     let restart = Command::new(bin())
@@ -196,10 +448,13 @@ fn server_run_status_restart_and_stop_round_trip() {
         ])
         .output()
         .expect("restart server");
+
     assert_runtime_success(&restart, &runtime_root);
 
     let restarted = server_status_json(&runtime_root);
+
     assert_eq!(restarted["status"], "running");
+
     assert_eq!(restarted["health"], "healthy");
 
     let stop = Command::new(bin())
@@ -211,19 +466,27 @@ fn server_run_status_restart_and_stop_round_trip() {
         ])
         .output()
         .expect("stop server");
+
     assert_runtime_success(&stop, &runtime_root);
+
     assert!(String::from_utf8_lossy(&stop.stdout).contains("server stopped"));
 
     let stopped = server_status_json(&runtime_root);
+
     assert_eq!(stopped["status"], "not_running");
 }
 
 #[test]
+
 fn stale_runtime_state_is_reported_and_recovered() {
     let fixture = create_fixture();
+
     let runtime_root = fixture.path().join("runtime");
+
     let _guard = ManagedServerGuard::new(runtime_root.clone());
+
     let account_dir = fixture.path().join(TEST_ACCOUNT_ID);
+
     let port = find_open_port();
 
     let run_args = [
@@ -248,15 +511,21 @@ fn stale_runtime_state_is_reported_and_recovered() {
         .args(run_args)
         .output()
         .expect("run server");
+
     assert_runtime_success(&run, &runtime_root);
 
     let status = server_status_json(&runtime_root);
+
     let pid = status["pid"].as_u64().expect("pid in status") as i32;
+
     let kill_result = unsafe { libc::kill(pid, libc::SIGKILL) };
+
     assert_eq!(kill_result, 0, "kill stale pid");
+
     wait_for_pid_exit(pid as u32);
 
     let stale = server_status_json(&runtime_root);
+
     assert_eq!(stale["status"], "stale");
 
     let cleanup = Command::new(bin())
@@ -268,26 +537,36 @@ fn stale_runtime_state_is_reported_and_recovered() {
         ])
         .output()
         .expect("stop stale server");
+
     assert!(cleanup.status.success(), "{cleanup:?}");
+
     assert!(String::from_utf8_lossy(&cleanup.stdout).contains("removed stale server state"));
 
     let rerun = Command::new(bin())
         .args(run_args)
         .output()
         .expect("rerun server after stale state");
+
     assert_runtime_success(&rerun, &runtime_root);
 
     let recovered = server_status_json(&runtime_root);
+
     assert_eq!(recovered["status"], "running");
+
     assert_eq!(recovered["health"], "healthy");
 }
 
 #[test]
+
 fn live_worker_with_bad_health_does_not_spawn_duplicate_and_can_be_stopped() {
     let fixture = create_fixture();
+
     let runtime_root = fixture.path().join("runtime");
+
     let _guard = ManagedServerGuard::new(runtime_root.clone());
+
     let account_dir = fixture.path().join(TEST_ACCOUNT_ID);
+
     let port = find_open_port();
 
     let run_args = [
@@ -312,14 +591,19 @@ fn live_worker_with_bad_health_does_not_spawn_duplicate_and_can_be_stopped() {
         .args(run_args)
         .output()
         .expect("run server");
+
     assert_runtime_success(&run, &runtime_root);
 
     let state_path = runtime_root.join("state.json");
+
     let mut state: serde_json::Value =
         serde_json::from_slice(&fs::read(&state_path).expect("read state json"))
             .expect("parse state json");
+
     state["base_url"] = serde_json::Value::String(format!("http://127.0.0.1:{}", port + 10));
+
     state["port"] = serde_json::Value::from((port + 10) as u64);
+
     fs::write(
         &state_path,
         serde_json::to_vec_pretty(&state).expect("serialize state"),
@@ -330,7 +614,9 @@ fn live_worker_with_bad_health_does_not_spawn_duplicate_and_can_be_stopped() {
         .args(run_args)
         .output()
         .expect("rerun unhealthy live server");
+
     assert!(!rerun.status.success(), "{rerun:?}");
+
     assert!(
         String::from_utf8_lossy(&rerun.stderr).contains("still running but unhealthy"),
         "{rerun:?}"
@@ -345,7 +631,9 @@ fn live_worker_with_bad_health_does_not_spawn_duplicate_and_can_be_stopped() {
         ])
         .output()
         .expect("stop unhealthy live server");
+
     assert!(stop.status.success(), "{stop:?}");
+
     assert!(String::from_utf8_lossy(&stop.stdout).contains("server stopped"));
 }
 
@@ -374,7 +662,9 @@ impl Drop for ManagedServerGuard {
 
 fn server_status_json(runtime_root: &Path) -> serde_json::Value {
     let deadline = Instant::now() + Duration::from_secs(10);
+
     let mut last = serde_json::Value::Null;
+
     while Instant::now() < deadline {
         let output = Command::new(bin())
             .args([
@@ -387,18 +677,24 @@ fn server_status_json(runtime_root: &Path) -> serde_json::Value {
             ])
             .output()
             .expect("run server status");
+
         assert!(output.status.success(), "{output:?}");
+
         let parsed: serde_json::Value =
             serde_json::from_slice(&output.stdout).expect("parse server status json");
+
         if matches!(
             parsed["status"].as_str(),
             Some("running" | "stale" | "not_running")
         ) {
             return parsed;
         }
+
         last = parsed;
+
         thread::sleep(Duration::from_millis(100));
     }
+
     last
 }
 
@@ -406,43 +702,65 @@ fn assert_runtime_success(output: &std::process::Output, runtime_root: &Path) {
     if output.status.success() {
         return;
     }
+
     let stderr_log = runtime_root.join("stderr.log");
+
     let log = fs::read_to_string(&stderr_log).unwrap_or_else(|_| "<no stderr log>".to_string());
+
     panic!("{output:?}\nworker stderr log:\n{log}");
 }
 
 fn wait_for_pid_exit(pid: u32) {
     let deadline = Instant::now() + Duration::from_secs(5);
+
     while Instant::now() < deadline {
         let alive = unsafe { libc::kill(pid as i32, 0) == 0 };
+
         if !alive {
             return;
         }
+
         thread::sleep(Duration::from_millis(50));
     }
 }
 
 fn create_fixture() -> TempDir {
     let dir = TempDir::new().expect("tempdir");
+
     let account_dir = dir.path().join(TEST_ACCOUNT_ID);
+
     let db_root = account_dir.join("db_storage");
+
     let contact_dir = db_root.join("contact");
+
     let session_dir = db_root.join("session");
+
     let message_dir = db_root.join("message");
+
     let attach_dir = account_dir.join("msg").join("attach");
+
     let file_dir = account_dir.join("msg").join("file");
+
     let video_dir = account_dir.join("msg").join("video");
 
     fs::create_dir_all(&contact_dir).expect("create contact dir");
+
     fs::create_dir_all(&session_dir).expect("create session dir");
+
     fs::create_dir_all(&message_dir).expect("create message dir");
+
     fs::create_dir_all(&attach_dir).expect("create attach dir");
+
     fs::create_dir_all(&file_dir).expect("create file dir");
+
     fs::create_dir_all(&video_dir).expect("create video dir");
 
     let raw_key = test_raw_key();
+
     create_encrypted_contact_db(&contact_dir.join("contact.db"), &raw_key);
+
     create_encrypted_session_db(&session_dir.join("session.db"), &raw_key);
+
     create_encrypted_message_db(&message_dir.join("message_0.db"), &raw_key);
 
     dir
@@ -450,8 +768,11 @@ fn create_fixture() -> TempDir {
 
 fn test_raw_key() -> [u8; 32] {
     let bytes = hex::decode(TEST_KEY_HEX).expect("decode test key");
+
     let mut raw_key = [0_u8; 32];
+
     raw_key.copy_from_slice(&bytes);
+
     raw_key
 }
 
@@ -460,17 +781,29 @@ fn create_encrypted_contact_db(path: &Path, raw_key: &[u8; 32]) {
         path,
         raw_key,
         "CREATE TABLE contact (
+
             username TEXT PRIMARY KEY,
+
             alias TEXT DEFAULT '',
+
             remark TEXT DEFAULT '',
+
             nick_name TEXT DEFAULT '',
+
             description TEXT DEFAULT NULL,
+
             extra_buffer BLOB DEFAULT NULL
+
         );
+
         CREATE TABLE contact_label (
+
             label_id_ TEXT,
+
             label_name_ TEXT,
+
             sort_order_ INTEGER
+
         );",
         |conn| {
             conn.execute(
@@ -487,12 +820,19 @@ fn create_encrypted_session_db(path: &Path, raw_key: &[u8; 32]) {
         path,
         raw_key,
         "CREATE TABLE SessionTable (
+
             username TEXT,
+
             sort_timestamp INTEGER,
+
             summary TEXT,
+
             last_msg_type INTEGER DEFAULT NULL,
+
             last_msg_sender TEXT DEFAULT NULL,
+
             last_sender_display_name TEXT DEFAULT NULL
+
         );",
         |conn| {
             conn.execute(
@@ -517,20 +857,35 @@ fn create_encrypted_message_db(path: &Path, raw_key: &[u8; 32]) {
         raw_key,
         &format!(
             "CREATE TABLE Timestamp (timestamp INTEGER);
+
             CREATE TABLE Name2Id (
+
                 rowid INTEGER PRIMARY KEY,
+
                 user_name TEXT
+
             );
+
             CREATE TABLE [{table}] (
+
                 sort_seq INTEGER,
+
                 server_id INTEGER,
+
                 local_type INTEGER,
+
                 real_sender_id INTEGER,
+
                 create_time INTEGER,
+
                 message_content BLOB,
+
                 packed_info_data BLOB,
+
                 status INTEGER,
+
                 WCDB_CT_message_content INTEGER
+
             );",
             table = MSG_TABLE
         ),
@@ -540,11 +895,13 @@ fn create_encrypted_message_db(path: &Path, raw_key: &[u8; 32]) {
                 params![1_700_000_000_i64],
             )
             .expect("insert timestamp");
+
             conn.execute(
                 "INSERT INTO Name2Id VALUES (?1, ?2)",
                 params![1_i64, TALKER],
             )
             .expect("insert name2id");
+
             conn.execute(
                 &format!(
                     "INSERT INTO [{table}] VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
@@ -569,24 +926,32 @@ fn create_encrypted_message_db(path: &Path, raw_key: &[u8; 32]) {
 
 fn create_encrypted_db(
     path: &Path,
+
     raw_key: &[u8; 32],
+
     schema_sql: &str,
+
     seed: impl FnOnce(&Connection),
 ) {
     let conn = Connection::open(path).expect("open sqlite");
+
     unsafe {
         let rc = rusqlite::ffi::sqlite3_key(
             conn.handle(),
             raw_key.as_ptr() as *const std::ffi::c_void,
             32,
         );
+
         assert_eq!(rc, 0, "sqlite3_key failed for {}", path.display());
     }
+
     conn.execute_batch(schema_sql).expect("apply schema");
+
     seed(&conn);
 }
 
 fn find_open_port() -> u16 {
     let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind ephemeral port");
+
     listener.local_addr().expect("listener addr").port()
 }

@@ -6,6 +6,15 @@ All notable changes to this project will be documented in this file.
 
 ## [0.7.4] - 2026-07-22
 
+### Security hardening (fork)
+
+- **Lock down the HTTP API** — CORS is opt-in, bearer auth is on by default, and a Host header guard blocks DNS-rebinding attempts
+- **Constant-time bearer token comparison** — remove the timing side channel in token validation
+- **Secrets out of argv and config** — key/token material is no longer passed via command-line arguments or persisted to `config.json`
+- **Restrictive permissions on key material** — key files are written `0600` inside `0700` directories
+- **No persistence of captured key material** — LLDB transcripts and `key extract` output are scrubbed rather than written to disk
+- **Contact hiding applies to search** — privacy filtering now also covers `/api/v1/search`
+
 ### Features
 
 - **Contact and conversation avatars** — Expose an optional `avatar_url` in contact and enriched session JSON, preferring the small avatar and falling back to the large avatar while remaining compatible with older database schemas

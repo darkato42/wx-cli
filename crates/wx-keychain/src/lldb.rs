@@ -49,6 +49,20 @@ fn debug_transcript_enabled() -> bool {
     std::env::var("WX_CLI_DEBUG_LLDB").map_or(false, |v| v == "1")
 }
 
+/// Whether an open failure should be treated as "the name exists" and retried
+/// after removing it: `AlreadyExists` (create_new on an existing path) or
+/// `ELOOP` — with `O_NOFOLLOW`, a pre-existing symlink surfaces as ELOOP
+/// rather than EEXIST, and the link name should be removed, never followed.
+#[cfg(unix)]
+fn is_stale_name(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::AlreadyExists || err.raw_os_error() == Some(libc::ELOOP)
+}
+
+#[cfg(not(unix))]
+fn is_stale_name(err: &std::io::Error) -> bool {
+    err.kind() == std::io::ErrorKind::AlreadyExists
+}
+
 /// Refuse symlinked temp-dir components.
 ///
 /// `ensure_dir`/`set_permissions` follow symlinks, so on a shared temp dir
@@ -99,8 +113,10 @@ fn write_redacted_transcript(
     use std::io::Write;
     let mut file = match open_write_0600(output_path) {
         Ok(file) => file,
-        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-            // Stale transcript from an earlier debug run: remove and retry.
+        Err(err) if is_stale_name(&err) => {
+            // Stale transcript from an earlier debug run (or a planted link:
+            // O_NOFOLLOW surfaces a pre-existing symlink as ELOOP): remove
+            // the name and retry once.
             std::fs::remove_file(output_path)?;
             open_write_0600(output_path)?
         }
@@ -208,11 +224,15 @@ pub async fn capture_key(
     }
     {
         use std::io::Write;
+        // Guard precedes the write so an early failure (disk full, spawn
+        // error later, cancellation) still removes the script on exit.
+        let _script_cleanup = ScriptCleanup(&script_path);
         let mut file = match open_write_0600(&script_path) {
             Ok(file) => file,
-            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
-                // Stale script from a crashed run (or a planted link):
-                // remove the name — never follow it — and retry once.
+            Err(err) if is_stale_name(&err) => {
+                // Stale script from a crashed run (or a planted link: with
+                // O_NOFOLLOW a pre-existing symlink surfaces as ELOOP).
+                // Remove the name — never follow it — and retry once.
                 std::fs::remove_file(&script_path)?;
                 open_write_0600(&script_path)?
             }
@@ -220,8 +240,6 @@ pub async fn capture_key(
         };
         file.write_all(CAPTURE_KEY_SCRIPT.as_bytes())?;
     }
-    // Removes the script on all exit paths (success, early error, cancel).
-    let _script_cleanup = ScriptCleanup(&script_path);
 
     // Prepare LLDB output file.
     let output_path = wx_paths::AppPaths::lldb_output_file();

@@ -530,9 +530,10 @@ enum KeyAction {
         /// Timeout in seconds for LLDB capture
         #[arg(long, default_value = "120")]
         timeout: u64,
-        /// Print the extracted key to stdout. Off by default: the key is saved
-        /// to the keystore either way, and printing it leaks it into shell
-        /// history, logs and terminal scrollback.
+        /// Print the extracted key to stdout. Off by default: on a successful
+        /// capture the key is saved to the keystore regardless, and printing
+        /// it additionally leaks it into shell history, logs and terminal
+        /// scrollback.
         #[arg(long)]
         print_key: bool,
     },

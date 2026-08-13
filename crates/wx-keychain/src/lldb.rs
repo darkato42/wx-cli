@@ -63,12 +63,24 @@ pub async fn capture_key(
     let _ = Command::new("killall").arg("WeChat").output();
     tokio::time::sleep(Duration::from_secs(1)).await;
 
-    // Write capture script to temp file.
+    // Write capture script to temp file. The script itself is not secret, but
+    // it is written 0600 out of an abundance of caution and removed once the
+    // capture finishes (see cleanup below).
     let script_path = wx_paths::AppPaths::lldb_script_file();
     if let Some(parent) = script_path.parent() {
         wx_paths::AppPaths::ensure_dir(parent)?;
     }
-    std::fs::write(&script_path, CAPTURE_KEY_SCRIPT)?;
+    {
+        use std::io::Write;
+        use std::os::unix::fs::OpenOptionsExt;
+        let mut file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&script_path)?;
+        file.write_all(CAPTURE_KEY_SCRIPT.as_bytes())?;
+    }
 
     // Prepare LLDB output file.
     let output_path = wx_paths::AppPaths::lldb_output_file();
@@ -198,16 +210,164 @@ pub async fn capture_key(
     })
     .await;
 
-    // Save output for debugging.
-    let _ = std::fs::write(&output_path, output_lines.join("\n"));
-
     // Kill LLDB.
     let _ = lldb.kill().await;
+
+    // The transcript contains the PBKDF2 password — i.e. the WeChat database
+    // key — and its salt. By default we do NOT persist it at all. When
+    // WX_CLI_DEBUG_LLDB=1 is set, a redacted copy (password/salt hex masked)
+    // is written with mode 0600 for debugging; the raw values never hit disk.
+    if std::env::var_os("WX_CLI_DEBUG_LLDB").is_some() {
+        let redacted = redact_sensitive_lines(&output_lines);
+        if let Some(parent) = output_path.parent() {
+            let _ = wx_paths::AppPaths::ensure_dir(parent);
+        }
+        {
+            use std::io::Write;
+            use std::os::unix::fs::OpenOptionsExt;
+            if let Ok(mut file) = std::fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .mode(0o600)
+                .open(&output_path)
+            {
+                let _ = file.write_all(redacted.join("\n").as_bytes());
+            }
+        }
+        eprintln!(
+            "WX_CLI_DEBUG_LLDB set: redacted LLDB transcript written to {}",
+            output_path.display()
+        );
+    } else if output_path.exists() {
+        // Clean up transcripts left by older versions.
+        let _ = std::fs::remove_file(&output_path);
+    }
+
+    // Remove the capture script now that the session is over.
+    let _ = std::fs::remove_file(&script_path);
 
     match result {
         Ok(inner) => inner,
         Err(_) => Err(KeychainError::CaptureTimeout {
             seconds: capture_timeout.as_secs(),
         }),
+    }
+}
+
+/// Mask the secret payload of every `Password:` / `Salt:` line in an LLDB
+/// transcript.
+///
+/// The transcript is the only persistent artifact of key capture and would
+/// otherwise contain the WeChat database key (PBKDF2 password) and salt in
+/// plaintext. Everything else — the lldb banner, breakpoint output, call
+/// headers — is left intact so debug sessions stay useful.
+///
+/// Line shapes handled (matching the capture regexes):
+///   `    Password: 4f3d...a1b2`  -> `    Password: <redacted>`
+///   `    Salt: 8c01...7e`        -> `    Salt: <redacted>`
+/// Lines that merely contain these words (e.g. error messages) are untouched
+/// unless they start with optional whitespace followed by the exact keyword.
+pub(crate) fn redact_sensitive_lines(lines: &[String]) -> Vec<String> {
+    fn mask(line: &str, keyword: &str) -> Option<String> {
+        let trimmed = line.trim_start();
+        let rest = trimmed.strip_prefix(keyword)?;
+        // Require "Keyword:" followed by whitespace and a hex payload so we
+        // never mask prose like "Password prompt failed".
+        if !rest.starts_with(':') {
+            return None;
+        }
+        let after = &rest[1..];
+        if !after.starts_with(char::is_whitespace) {
+            return None;
+        }
+        let value = after.trim_start();
+        if value.is_empty() || !value.chars().all(|c| c.is_ascii_hexdigit()) {
+            return None;
+        }
+        let indent = &line[..line.len() - line.trim_start().len()];
+        Some(format!("{indent}{keyword}: <redacted>"))
+    }
+
+    lines
+        .iter()
+        .map(|line| {
+            mask(line, "Password")
+                .or_else(|| mask(line, "Salt"))
+                .unwrap_or_else(|| line.clone())
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::redact_sensitive_lines;
+
+    fn lines(input: &[&str]) -> Vec<String> {
+        input.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn password_and_salt_hex_are_masked() {
+        let input = lines(&[
+            "[PBKDF2 #1] rounds=256000",
+            "    Password: 4f3daabbccddeeff00112233445566778899aabbccddeeff0011223344556677",
+            "    Salt: 8c01fe7a",
+            "done",
+        ]);
+        let out = redact_sensitive_lines(&input);
+        assert_eq!(out[0], "[PBKDF2 #1] rounds=256000");
+        assert_eq!(out[1], "    Password: <redacted>");
+        assert_eq!(out[2], "    Salt: <redacted>");
+        assert_eq!(out[3], "done");
+        // The raw hex values must not survive anywhere.
+        let joined = out.join(
+            "
+",
+        );
+        assert!(!joined.contains("4f3daabb"));
+        assert!(!joined.contains("8c01fe7a"));
+    }
+
+    #[test]
+    fn indentation_is_preserved() {
+        let input = lines(&["  Password: deadbeef"]);
+        let out = redact_sensitive_lines(&input);
+        assert_eq!(out[0], "  Password: <redacted>");
+    }
+
+    #[test]
+    fn prose_mentioning_keywords_is_not_masked() {
+        let input = lines(&[
+            "Password prompt failed: not a hex payload",
+            "Salt:  not-hex",
+            "Salt: 12ab!",
+            "error: Salt: has colon but bad value",
+        ]);
+        let out = redact_sensitive_lines(&input);
+        assert_eq!(out, input, "non-hex lines must pass through unchanged");
+    }
+
+    #[test]
+    fn empty_and_short_lines_are_untouched() {
+        let input = lines(&["", "   ", "Password:", "Salt:"]);
+        let out = redact_sensitive_lines(&input);
+        assert_eq!(out, input);
+    }
+
+    #[test]
+    fn long_transcript_masks_all_calls() {
+        let mut input = Vec::new();
+        for i in 0..3 {
+            input.push(format!("[PBKDF2 #{i}] rounds=256000"));
+            input.push(format!("    Password: {:064x}", i));
+            input.push(format!("    Salt: {:032x}", i + 1));
+        }
+        let out = redact_sensitive_lines(&input);
+        for line in &out {
+            if line.contains("Password:") || line.contains("Salt:") {
+                assert!(line.ends_with("<redacted>"), "{line}");
+            }
+        }
     }
 }

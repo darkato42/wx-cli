@@ -266,13 +266,19 @@ fn spawn_worker(
     worker_id: &str,
     runtime_root: Option<&PathBuf>,
 ) -> Result<Child, Box<dyn std::error::Error>> {
+    // Logs may contain the auth token (or message content), so they are
+    // created 0600: on macOS there is no hidepid, and umask-created files
+    // (typically 0644) would leak them to any local user.
+    use std::os::unix::fs::OpenOptionsExt;
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(ap.server_stdout_log())?;
     let stderr = OpenOptions::new()
         .create(true)
         .append(true)
+        .mode(0o600)
         .open(ap.server_stderr_log())?;
 
     let mut command = Command::new(std::env::current_exe()?);

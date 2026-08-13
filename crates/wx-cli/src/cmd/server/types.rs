@@ -41,10 +41,8 @@ pub struct ServerRunArgs {
 
     /// Bearer token for authentication.
     ///
-    /// If omitted, a random token is generated and stored in the launch config
-    /// so local `wx-cli` commands keep working transparently. Prefer the
-    /// `WX_CLI_SERVER_TOKEN` environment variable: arguments passed here are
-    /// visible to every local user via `ps`.
+    /// If omitted, a random token is generated automatically and printed at
+    /// startup.
     #[arg(long)]
     pub token: Option<String>,
 
@@ -135,10 +133,8 @@ pub struct ServerWorkerArgs {
 
     /// Bearer token for authentication.
     ///
-    /// If omitted, a random token is generated and stored in the launch config
-    /// so local `wx-cli` commands keep working transparently. Prefer the
-    /// `WX_CLI_SERVER_TOKEN` environment variable: arguments passed here are
-    /// visible to every local user via `ps`.
+    /// If omitted, a random token is generated automatically and printed at
+    /// startup.
     #[arg(long)]
     pub token: Option<String>,
 

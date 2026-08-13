@@ -81,8 +81,7 @@ pub async fn host_guard(
             StatusCode::FORBIDDEN,
             axum::Json(json!({
                 "error": "forbidden_host",
-                "detail": "Host header is not an allowed hostname. \
-                           Use a loopback address, or pass --allow-host to permit this name.",
+                "detail": "Host header is not an allowed hostname. Use a loopback address, or pass --allow-host to permit this name.",
             })),
         )
             .into_response(),

@@ -211,9 +211,13 @@ fn unconfigured_origin_does_not_receive_cors_headers() {
         ],
     );
     let raw = response.raw.to_ascii_lowercase();
+    // The CORS layer is only installed when --cors-origin is configured, so an
+    // unconfigured server must emit NO Access-Control-Allow-Origin header at
+    // all. Asserting absence (not just non-echo) guards against regressions to
+    // `Access-Control-Allow-Origin: *`.
     assert!(
-        !raw.contains("access-control-allow-origin: https://evil.example.com"),
-        "unlisted origin must not be allowed: {}",
+        !raw.contains("access-control-allow-origin"),
+        "unconfigured origins must receive no Access-Control-Allow-Origin header at all: {}",
         response.raw
     );
 }

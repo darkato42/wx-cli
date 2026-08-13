@@ -352,9 +352,17 @@ pub async fn cmd_serve(
     } else {
         "DISABLED (--no-auth)"
     };
+    // Only print the token on direct invocation. Under `wx-cli server run` the
+    // manager passes it via WX_CLI_WORKER_TOKEN and persists it in the 0600
+    // secrets file; printing it here would write the secret into the
+    // persistent stderr log.
     if let Some(ref t) = token {
-        eprintln!("wx-cli: auth token: {t}");
-        eprintln!("  Use: curl -H 'Authorization: Bearer {t}' http://{bind_addr}/api/v1/health");
+        if std::env::var_os("WX_CLI_WORKER_TOKEN").is_none() {
+            eprintln!("wx-cli: auth token: {t}");
+            eprintln!(
+                "  Use: curl -H 'Authorization: Bearer {t}' http://{bind_addr}/api/v1/health"
+            );
+        }
     }
     if cors_origins.is_empty() {
         eprintln!("  CORS: disabled (no browser origin may read responses)");

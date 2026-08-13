@@ -84,11 +84,24 @@ fn worker_logs_are_tightened_to_0600_even_if_preexisting() {
 
 #[test]
 fn launch_config_json_contains_no_secrets_and_secrets_file_is_0600() {
+    use std::os::unix::fs::OpenOptionsExt;
+
     let fixture = create_fixture();
     let runtime_root = fixture.path().join("runtime");
     let _guard = ManagedServerGuard::new(runtime_root.clone());
     let account_dir = fixture.path().join(TEST_ACCOUNT_ID);
     let port = find_open_port();
+
+    // Crash-recovery scenario: a stale temp file left by an interrupted run
+    // with world-readable perms. save_secrets_file must tighten it before
+    // writing secrets into it (mode() applies only at creation).
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    fs::OpenOptions::new()
+        .create(true)
+        .write(true)
+        .mode(0o644)
+        .open(runtime_root.join("secrets.json.tmp"))
+        .expect("pre-create permissive temp");
 
     let run = Command::new(bin())
         .args([
@@ -141,6 +154,12 @@ fn launch_config_json_contains_no_secrets_and_secrets_file_is_0600() {
         .mode();
     // Owner read/write only — no group/world bits.
     assert_eq!(mode & 0o777, 0o600, "secrets.json mode was {mode:o}");
+
+    // The temp file must not survive the save.
+    assert!(
+        !runtime_root.join("secrets.json.tmp").exists(),
+        "secrets.json.tmp should be renamed away"
+    );
 }
 
 /// On Linux, verify the worker's argv (what `ps` would show on macOS) carries

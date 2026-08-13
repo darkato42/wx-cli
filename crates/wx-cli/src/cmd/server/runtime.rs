@@ -157,6 +157,11 @@ fn save_secrets_file(
             .write(true)
             .mode(0o600)
             .open(&temp)?;
+        // `.mode(0o600)` only applies at creation: a stale temp left by a
+        // crashed earlier run keeps its old (possibly 0644) mode. Tighten
+        // right after open so secrets are never written into a permissive
+        // file, even mid-window before the rename.
+        fs::set_permissions(&temp, fs::Permissions::from_mode(0o600))?;
         file.write_all(&serde_json::to_vec_pretty(secrets)?)?;
         file.flush()?;
     }

@@ -1,4 +1,4 @@
-use std::fs::OpenOptions;
+use std::fs::{self, OpenOptions};
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
@@ -35,9 +35,24 @@ pub async fn cmd_server_run(args: ServerRunArgs) -> Result<(), Box<dyn std::erro
     let args_runtime_root = args.runtime_root.clone();
     let ap = resolve_app_paths(args_runtime_root.clone())?;
     let _lock = acquire_management_lock(&ap)?;
-    let config: ServerLaunchConfig = args.into();
+    let mut config: ServerLaunchConfig = args.into();
 
     validate_launch_config(&config)?;
+
+    // Authentication is on by default (see serve/mod.rs). The token must be
+    // generated HERE, in the manager, rather than letting the worker mint one
+    // internally: `build_status_report` probes /api/v1/health using the token
+    // from the persisted launch config, so `server status`/`restart` can only
+    // authenticate if manager and worker share the value. Persisted via the
+    // normal save_launch_config path (replaced by the 0600 secrets file in the
+    // next stacked PR), and reused across runs so idempotent `server run` does
+    // not trip the launch-config drift check.
+    if !config.no_auth && config.token.is_none() {
+        config.token = load_launch_config(&ap)?
+            .and_then(|existing| existing.token)
+            .or_else(|| Some(crate::cmd::serve::generate_auth_token()));
+    }
+
     ap.ensure_server_dirs()?;
 
     let existing_state = load_runtime_state(&ap)?;
@@ -268,18 +283,25 @@ fn spawn_worker(
 ) -> Result<Child, Box<dyn std::error::Error>> {
     // Logs may contain the auth token (or message content), so they are
     // created 0600: on macOS there is no hidepid, and umask-created files
-    // (typically 0644) would leak them to any local user.
-    use std::os::unix::fs::OpenOptionsExt;
+    // (typically 0644) would leak them to any local user. `mode(0o600)` only
+    // applies on creation, so we also re-assert 0600 after opening — logs
+    // left behind by an older version with broader permissions would
+    // otherwise stay readable.
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+    let stdout_path = ap.server_stdout_log();
+    let stderr_path = ap.server_stderr_log();
     let stdout = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(ap.server_stdout_log())?;
+        .open(&stdout_path)?;
     let stderr = OpenOptions::new()
         .create(true)
         .append(true)
         .mode(0o600)
-        .open(ap.server_stderr_log())?;
+        .open(&stderr_path)?;
+    let _ = fs::set_permissions(&stdout_path, fs::Permissions::from_mode(0o600));
+    let _ = fs::set_permissions(&stderr_path, fs::Permissions::from_mode(0o600));
 
     let mut command = Command::new(std::env::current_exe()?);
     command

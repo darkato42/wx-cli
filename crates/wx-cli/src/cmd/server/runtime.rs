@@ -5,7 +5,7 @@ use std::process::Command;
 use std::time::{Duration, Instant};
 
 use serde::de::DeserializeOwned;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 use wx_paths::AppPaths;
 
 use super::types::{ServerHealthPayload, ServerLaunchConfig, ServerRuntimeState, ServerSecrets};
@@ -85,8 +85,9 @@ pub fn save_runtime_state(
 }
 
 /// Load the persisted launch config, re-attaching any secrets from the
-/// separate 0600 secrets file. A missing secrets file (e.g. written by an
-/// older version that stored secrets inline) yields a config with no secrets.
+/// separate 0600 secrets file. When the secrets file is absent (upgrade from
+/// a version that stored secrets inline in config.json), falls back to the
+/// legacy inline fields so restart/status do not lose the key/token.
 pub fn load_launch_config(
     ap: &AppPaths,
 ) -> Result<Option<ServerLaunchConfig>, Box<dyn std::error::Error>> {
@@ -96,8 +97,25 @@ pub fn load_launch_config(
     if let Some(secrets) = load_json::<ServerSecrets>(&ap.server_secrets_file())? {
         config.key = secrets.key;
         config.token = secrets.token;
+    } else if let Some(legacy) = load_json::<LegacyLaunchConfig>(&ap.server_config_file())? {
+        // Pre-secrets-file configs stored key/token inline. `#[serde(skip)]`
+        // on ServerLaunchConfig ignores those fields during the normal
+        // deserialize above, so read them explicitly here.
+        config.key = legacy.key.or(config.key);
+        config.token = legacy.token.or(config.token);
     }
     Ok(Some(config))
+}
+
+/// Deserialization shape for launch configs written by versions that stored
+/// `key`/`token` inline in `config.json`. Used only as an upgrade fallback
+/// when `secrets.json` is missing; modern configs carry no secret fields.
+#[derive(Deserialize)]
+struct LegacyLaunchConfig {
+    #[serde(default)]
+    key: Option<String>,
+    #[serde(default)]
+    token: Option<String>,
 }
 
 /// Persist the launch config. `key` and `token` are serialization-skipped on

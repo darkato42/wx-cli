@@ -29,6 +29,12 @@ async fn cmd_server_worker(args: ServerWorkerArgs) -> Result<(), Box<dyn std::er
         args.token = std::env::var("WX_CLI_WORKER_TOKEN").ok();
     }
 
+    // The secrets are now in memory; strip them from the environment so any
+    // subprocess the worker spawns (e.g. LLDB capture helpers) does not
+    // inherit them by default.
+    std::env::remove_var("WX_CLI_WORKER_KEY");
+    std::env::remove_var("WX_CLI_WORKER_TOKEN");
+
     let ap = match args.runtime_root.clone() {
         Some(root) => wx_paths::AppPaths::with_runtime_root(root)?,
         None => wx_paths::AppPaths::new()?,

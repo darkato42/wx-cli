@@ -185,19 +185,98 @@ fn worker_argv_contains_no_key_or_token() {
         .map(|s| String::from_utf8_lossy(s).into_owned())
         .collect();
     let joined = argv.join(" ");
+    // NOTE: the assertion messages deliberately do NOT include `joined` — if
+    // a regression reintroduces a secret into argv, printing it would leak the
+    // secret into CI logs.
     assert!(
         !joined.contains(TEST_KEY_HEX),
-        "worker argv must not contain the key: {joined}"
+        "worker argv must not contain the key"
     );
     assert!(
         !joined.contains("--token") && !joined.contains("--key"),
-        "worker argv must not carry secrets via flags: {joined}"
+        "worker argv must not carry secrets via flags"
     );
     // The worker-id flag legitimately stays in argv (process identification).
     assert!(
         joined.contains("_worker"),
-        "worker argv should still identify the worker role: {joined}"
+        "worker argv should still identify the worker role"
     );
+}
+
+/// Upgrade path: versions before the secrets split stored `key`/`token`
+/// inline in `config.json`. `load_launch_config` must fall back to those when
+/// `secrets.json` is absent, or restart/status would silently lose the key
+/// (the worker could no longer open the encrypted DB).
+#[test]
+fn legacy_inline_secrets_in_config_json_are_still_honored() {
+    let fixture = create_fixture();
+    let runtime_root = fixture.path().join("runtime");
+    let _guard = ManagedServerGuard::new(runtime_root.clone());
+    let account_dir = fixture.path().join(TEST_ACCOUNT_ID);
+    let port = find_open_port();
+
+    let run_args = [
+        "server",
+        "run",
+        "--data-dir",
+        account_dir.to_str().expect("fixture path utf8"),
+        "--key",
+        TEST_KEY_HEX,
+        "--host",
+        "127.0.0.1",
+        "--port",
+        &port.to_string(),
+        "--poll",
+        "--poll-ms",
+        "1000",
+        "--runtime-root",
+        runtime_root.to_str().expect("runtime root utf8"),
+    ];
+
+    // First run writes the modern config.json + secrets.json and starts a worker.
+    let run = Command::new(bin())
+        .args(run_args.clone())
+        .output()
+        .expect("run server");
+    assert_runtime_success(&run, &runtime_root);
+
+    // Stop cleanly, then simulate an old installation: secrets.json removed
+    // and config.json rewritten with key/token inline (pre-secrets format).
+    let stop = Command::new(bin())
+        .args(["server", "stop", "--runtime-root"])
+        .arg(runtime_root.to_str().expect("runtime root utf8"))
+        .output()
+        .expect("stop server");
+    assert!(stop.status.success(), "stop failed: {stop:?}");
+    wait_for_pid_exit(
+        server_status_json(&runtime_root)["pid"]
+            .as_u64()
+            .unwrap_or(0) as u32,
+    );
+
+    let config_path = runtime_root.join("config.json");
+    let mut text = fs::read_to_string(&config_path).expect("read config.json");
+    text = text.replacen(
+        '{',
+        &format!(r#"{{"key": "{TEST_KEY_HEX}", "token": null,"#),
+        1,
+    );
+    fs::write(&config_path, text).expect("rewrite legacy config");
+    fs::remove_file(runtime_root.join("secrets.json")).expect("remove secrets.json");
+
+    // Restart without re-supplying --key: the key now has to come entirely
+    // from the persisted config. The legacy inline fallback must restore it,
+    // or the worker cannot open the encrypted DB and never becomes ready.
+    let restart = Command::new(bin())
+        .args([
+            "server",
+            "restart",
+            "--runtime-root",
+            runtime_root.to_str().expect("runtime root utf8"),
+        ])
+        .output()
+        .expect("restart server");
+    assert_runtime_success(&restart, &runtime_root);
 }
 
 #[test]

@@ -370,6 +370,32 @@ fn search_still_returns_visible_sender_messages() {
     );
 }
 
+/// Paging fields must describe the visible set exactly: hidden hits are
+/// filtered BEFORE limit/offset, so total/has_more stay accurate and hidden
+/// counts never leak into paging fields.
+#[test]
+fn search_paging_totals_reflect_visible_set() {
+    let server = spawn_test_server_with_hidden_contacts(&[HIDDEN_SENDER]);
+    // q=plans matches two visible messages + one hidden-sender message.
+    let response = http_get(&server.base_url, "/api/v1/search?q=plans&limit=1&offset=0");
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(body.contains("paging plans beta"), "{body}");
+    assert!(body.contains(r#""total":2"#), "{body}");
+    assert!(body.contains(r#""has_more":true"#), "{body}");
+    assert!(body.contains(r#""returned":1"#), "{body}");
+
+    let response = http_get(&server.base_url, "/api/v1/search?q=plans&limit=1&offset=1");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(body.contains("paging plans alpha"), "{body}");
+    assert!(body.contains(r#""has_more":false"#), "{body}");
+
+    // show_hidden=1 restores the full count (hidden hit included).
+    let response = http_get(&server.base_url, "/api/v1/search?q=plans&show_hidden=1");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(body.contains(r#""total":3"#), "{body}");
+}
+
 fn spawn_test_server() -> TestServer {
     spawn_test_server_with_env(&[])
 }
@@ -944,6 +970,33 @@ fn create_encrypted_message_db(path: &Path, raw_key: &[u8; 32]) {
                 ],
             )
             .expect("insert hidden-sender message");
+
+            // Two visible text messages sharing the "plans" keyword, so the
+            // paging tests can exercise total/has_more against a multi-hit
+            // result set that also contains a hidden-sender hit.
+            for (sort_seq, server_id, content) in [
+                (500_i64, 2004_i64, b"paging plans beta" as &[u8]),
+                (400_i64, 2005_i64, b"paging plans alpha" as &[u8]),
+            ] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO [{table}] VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        table = MSG_TABLE
+                    ),
+                    params![
+                        sort_seq,
+                        server_id,
+                        1_i64,
+                        1_i64, // TALKER
+                        1_709_251_200_i64 + sort_seq,
+                        content,
+                        None::<Vec<u8>>,
+                        0_i32,
+                        None::<i32>,
+                    ],
+                )
+                .expect("insert plans message");
+            }
 
             let video_info_msg_video = encode_packed_info_for_test(None, Some("vid002"));
             conn.execute(

@@ -740,8 +740,8 @@ pub async fn handler_search(
             match wx_db::native_fts::search_message_fts_with_cache(
                 &fts_guard,
                 &q_clone,
-                limit,
-                offset,
+                wx_db::MAX_QUERY_LIMIT,
+                0,
                 Some(&name2id),
             ) {
                 Ok(result) => {
@@ -751,19 +751,23 @@ pub async fn handler_search(
                         .map(|hit| enrich_native_fts_hit(hit, &self_wxid_clone, &resolver_clone))
                         .collect();
                     // Contact hiding applies to search results too: drop hits
-                    // from/into hidden persons, then rebuild paging on the
-                    // visible slice. (Post-filtering may return fewer than
-                    // `limit` rows; totals reflect the visible set.)
+                    // from/into hidden persons, then page the visible slice.
+                    // Filtering BEFORE limit/offset keeps total/has_more exact
+                    // for the visible set and never leaks hidden counts into
+                    // paging fields (the window is bounded by MAX_QUERY_LIMIT,
+                    // same as the timeline endpoint).
                     let items = crate::visibility_projection::project_search_hits(
                         items,
                         &visibility_clone,
                         show_hidden,
                     );
-                    let returned = items.len();
                     let total = items.len();
-                    let has_more = offset + returned < total;
+                    let start = offset.min(total);
+                    let page: Vec<_> = items.into_iter().skip(start).take(limit).collect();
+                    let returned = page.len();
+                    let has_more = start + returned < total;
                     Ok(JsonEnvelope {
-                        items,
+                        items: page,
                         paging: crate::output::PagingMeta {
                             limit,
                             offset,
@@ -812,7 +816,9 @@ pub async fn handler_search(
             let first_attempt = guard
                 .pool()
                 .and_then(|pool| pool.fts_conn())
-                .map(|fts_conn| wx_db::native_fts::search_message_fts(fts_conn, &q, limit, offset));
+                .map(|fts_conn| {
+                    wx_db::native_fts::search_message_fts(fts_conn, &q, wx_db::MAX_QUERY_LIMIT, 0)
+                });
 
             match first_attempt {
                 Some(Ok(r)) => Some(r),
@@ -827,7 +833,10 @@ pub async fn handler_search(
                                 .and_then(|pool| pool.fts_conn())
                                 .and_then(|fts_conn| {
                                     match wx_db::native_fts::search_message_fts(
-                                        fts_conn, &q, limit, offset,
+                                        fts_conn,
+                                        &q,
+                                        wx_db::MAX_QUERY_LIMIT,
+                                        0,
                                     ) {
                                         Ok(r) => Some(r),
                                         Err(e2) => {
@@ -922,8 +931,7 @@ pub async fn handler_search(
                 });
 
                 let total = all_hits.len();
-                let page: Vec<_> = all_hits.into_iter().skip(offset).take(limit).collect();
-                let enriched: Vec<_> = page
+                let enriched: Vec<_> = all_hits
                     .into_iter()
                     .map(|(m, talker)| enrich_message_as_hit(m, talker, &self_wxid, &resolver))
                     .collect();
@@ -938,20 +946,23 @@ pub async fn handler_search(
         };
 
         // Contact hiding applies to search results: drop hits from/into
-        // hidden persons, then rebuild paging on the visible slice.
+        // hidden persons, then page the visible slice. Filtering BEFORE
+        // limit/offset keeps total/has_more exact for the visible set.
         let visible_hits =
             crate::visibility_projection::project_search_hits(hits, &visibility_scan, show_hidden);
-        let returned = visible_hits.len();
-        let visible_total = visible_hits.len();
-        let has_more = offset + returned < visible_total;
+        let total = visible_hits.len();
+        let start = offset.min(total);
+        let items: Vec<_> = visible_hits.into_iter().skip(start).take(limit).collect();
+        let returned = items.len();
+        let has_more = start + returned < total;
         let envelope = JsonEnvelope {
-            items: visible_hits,
+            items,
             paging: crate::output::PagingMeta {
                 limit,
                 offset,
                 returned,
                 has_more,
-                total: visible_total,
+                total,
             },
             stats: crate::output::StatsMeta {
                 scanned: scan_scanned,

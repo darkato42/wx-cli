@@ -159,6 +159,43 @@ mod tests {
         assert_eq!(envelope.stats.scanned, 3);
     }
 
+    fn search_hit(sender: &str, talker: &str) -> crate::schema::SearchHit {
+        crate::schema::SearchHit {
+            server_id: 1,
+            talker: talker.to_string(),
+            talker_display_name: talker.to_string(),
+            sender: sender.to_string(),
+            sender_display_name: sender.to_string(),
+            direction: wx_context::Direction::Incoming,
+            create_time: 1,
+            sort_seq: 1,
+            msg_type: 1,
+            sub_type: 0,
+            snippet: "snippet".to_string(),
+            hit_type: "Message".to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_sender_is_never_treated_as_hidden() {
+        // A hit whose sender failed to resolve (empty string) must not be
+        // filtered just because the hidden set exists.
+        let hidden = wx_context::VisibilityIndex::build(
+            &["wxid_spam".to_string()],
+            &[],
+            &wx_context::ContactResolver::empty(),
+        );
+        let hits = vec![
+            search_hit("", "wxid_alice"),
+            search_hit("wxid_spam", "wxid_alice"),
+            search_hit("wxid_bob", "wxid_spam"),
+        ];
+        let visible = project_search_hits(hits, &hidden, false);
+        assert_eq!(visible.len(), 1, "only the clean hit survives");
+        assert_eq!(visible[0].sender, "");
+        assert_eq!(visible[0].talker, "wxid_alice");
+    }
+
     #[test]
     fn show_hidden_bypasses_filtering() {
         let envelope = project_visible_envelope(

@@ -4,7 +4,7 @@ All notable changes to this project will be documented in this file.
 
 ## [Unreleased]
 
-## [0.7.4] - 2026-07-22
+## [0.7.5] - 2026-08-13
 
 ### Security hardening (fork)
 
@@ -14,6 +14,12 @@ All notable changes to this project will be documented in this file.
 - **Restrictive permissions on key material** — key files are written `0600` inside `0700` directories
 - **No persistence of captured key material** — LLDB transcripts and `key extract` output are scrubbed rather than written to disk
 - **Contact hiding applies to search** — privacy filtering now also covers `/api/v1/search`
+
+### Maintenance
+
+- Fix `clippy::unnecessary_map_or` to keep CI green on the current stable Rust toolchain
+
+## [0.7.4] - 2026-07-22
 
 ### Features
 

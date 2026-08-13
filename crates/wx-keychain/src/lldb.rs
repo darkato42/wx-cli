@@ -69,19 +69,52 @@ fn is_stale_name(err: &std::io::Error) -> bool {
 /// another user could pre-create `$TMPDIR/wx-cli` (or a subdir) as a symlink
 /// and redirect our permission changes and file creation to an unexpected
 /// location. Fail closed instead of hardening through a link.
-fn ensure_not_symlink(path: &std::path::Path) -> Result<(), KeychainError> {
-    match std::fs::symlink_metadata(path) {
-        Ok(meta) if meta.file_type().is_symlink() => Err(KeychainError::Other(format!(
-            "refusing to use symlinked temp dir {}",
-            path.display()
-        ))),
-        Ok(_) => Ok(()),
-        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
-        Err(err) => Err(KeychainError::Other(format!(
-            "could not inspect temp dir {}: {err}",
-            path.display()
-        ))),
+/// Atomically create-if-needed and tighten a directory to 0700, refusing to
+/// follow a symlink at that exact path component. Unlike a check-then-act
+/// pair (symlink check + `create_dir_all` + `set_permissions`), this
+/// opens the directory with `O_NOFOLLOW | O_DIRECTORY` and calls `fchmod` on
+/// the resulting file descriptor, so there is no window between the symlink
+/// check and the permission change for another local user to swap the path
+/// component and redirect the chmod/subsequent writes.
+#[cfg(unix)]
+fn create_and_secure_dir_atomic(dir: &std::path::Path) -> Result<(), KeychainError> {
+    use std::os::unix::io::AsRawFd;
+
+    // mkdir first (best-effort: may already exist, may race with another
+    // process, may fail because a symlink occupies the name — all handled
+    // by the O_NOFOLLOW open below, which is the actual security boundary).
+    let _ = std::fs::create_dir(dir);
+
+    let cpath = std::ffi::CString::new(dir.as_os_str().as_encoded_bytes()).map_err(|_| {
+        KeychainError::Other(format!("invalid path for capture dir: {}", dir.display()))
+    })?;
+    // SAFETY: cpath is a valid NUL-terminated C string for the duration of
+    // the call; the returned fd is owned and closed via File's Drop.
+    let fd = unsafe {
+        libc::open(
+            cpath.as_ptr(),
+            libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_DIRECTORY | libc::O_CLOEXEC,
+        )
+    };
+    if fd < 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(KeychainError::Other(format!(
+            "could not open capture dir {} (symlink or missing): {err}",
+            dir.display()
+        )));
     }
+    // SAFETY: fd is a just-opened, valid, owned file descriptor.
+    let file = unsafe { <std::fs::File as std::os::unix::io::FromRawFd>::from_raw_fd(fd) };
+    // SAFETY: file.as_raw_fd() is valid for the duration of this call.
+    let rc = unsafe { libc::fchmod(file.as_raw_fd(), 0o700) };
+    if rc != 0 {
+        let err = std::io::Error::last_os_error();
+        return Err(KeychainError::Other(format!(
+            "could not secure capture dir {} to 0700: {err}",
+            dir.display()
+        )));
+    }
+    Ok(())
 }
 
 /// RAII guard: removes the capture script on every exit path, so an early
@@ -183,43 +216,20 @@ pub async fn capture_key(
     if let Some(parent) = script_path.parent() {
         // Reject symlinked components before creating or tightening: another
         // user on a shared temp dir could pre-create the root (or the lldb
-        // dir) as a symlink, redirecting our chmods and file creation.
-        if let Some(root) = parent.parent() {
-            ensure_not_symlink(root)?;
-        }
-        ensure_not_symlink(parent)?;
-        wx_paths::AppPaths::ensure_dir(parent)?;
-        // The lldb dir may sit in a shared temp location; make it owner-only
-        // so other local users cannot plant symlinks into the capture paths.
+        // dir) as a symlink, redirecting our chmods and file creation. Both
+        // components are secured atomically (open O_NOFOLLOW + fchmod on the
+        // fd) rather than check-then-act, closing the TOCTOU window between
+        // a symlink check and a path-based create_dir_all/set_permissions.
         #[cfg(unix)]
         {
-            use std::os::unix::fs::PermissionsExt;
-            // Fail closed: the capture writes key material into this dir, so
-            // if it cannot be secured against other local users we must not
-            // proceed (the "no planted symlinks" guarantee would not hold).
-            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
-                |err| {
-                    KeychainError::Other(format!(
-                        "could not secure LLDB capture dir {} to 0700: {err}",
-                        parent.display()
-                    ))
-                },
-            )?;
-            // The wx-cli temp root itself must be secured too: if an
-            // attacker pre-created `$TMPDIR/wx-cli` permissively, they could
-            // delete/replace the `lldb/` entry between runs and redirect
-            // capture artifacts, so the lldb-dir tightening alone would not
-            // hold. Fail closed on the whole chain.
             if let Some(root) = parent.parent() {
-                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(
-                    |err| {
-                        KeychainError::Other(format!(
-                            "could not secure wx-cli temp root {} to 0700: {err}",
-                            root.display()
-                        ))
-                    },
-                )?;
+                create_and_secure_dir_atomic(root)?;
             }
+            create_and_secure_dir_atomic(parent)?;
+        }
+        #[cfg(not(unix))]
+        {
+            wx_paths::AppPaths::ensure_dir(parent)?;
         }
     }
     // Guard lives at function scope for the WHOLE capture: it must be alive
@@ -388,24 +398,20 @@ pub async fn capture_key(
         // potentially hostile path.
         let mut dir_secure = true;
         if let Some(parent) = output_path.parent() {
-            if let Err(err) = ensure_not_symlink(parent) {
-                eprintln!("WARNING: {err} — skipping redacted LLDB transcript");
-                dir_secure = false;
-            } else {
+            #[cfg(unix)]
+            {
+                // Same atomic (open O_NOFOLLOW + fchmod) hardening as the
+                // script path: no check-then-act window for another local
+                // user to swap a path component with a symlink.
+                if let Err(err) = create_and_secure_dir_atomic(parent) {
+                    eprintln!("WARNING: {err} — skipping redacted LLDB transcript");
+                    dir_secure = false;
+                }
+            }
+            #[cfg(not(unix))]
+            {
                 if let Err(err) = wx_paths::AppPaths::ensure_dir(parent) {
                     eprintln!("WARNING: could not create {}: {err}", parent.display());
-                }
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt;
-                    if let Err(err) =
-                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-                    {
-                        eprintln!(
-                            "WARNING: could not tighten {} to 0700: {err}",
-                            parent.display()
-                        );
-                    }
                 }
             }
         }
@@ -552,20 +558,42 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn symlinked_temp_dir_components_are_rejected() {
-        use super::ensure_not_symlink;
+        use super::create_and_secure_dir_atomic;
+        use std::os::unix::fs::PermissionsExt;
+
         let tmp = tempfile::tempdir().unwrap();
+
+        // A real, not-yet-existing directory is created and tightened.
         let real_dir = tmp.path().join("real");
-        std::fs::create_dir(&real_dir).unwrap();
-        assert!(ensure_not_symlink(&real_dir).is_ok());
-        assert!(ensure_not_symlink(&tmp.path().join("missing")).is_ok());
+        assert!(create_and_secure_dir_atomic(&real_dir).is_ok());
+        let mode = std::fs::metadata(&real_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        // An existing, permissive directory gets tightened too.
+        let loose_dir = tmp.path().join("loose");
+        std::fs::create_dir(&loose_dir).unwrap();
+        std::fs::set_permissions(&loose_dir, std::fs::Permissions::from_mode(0o755)).unwrap();
+        assert!(create_and_secure_dir_atomic(&loose_dir).is_ok());
+        let mode = std::fs::metadata(&loose_dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700);
+
+        // A symlinked name at the target path is refused: O_NOFOLLOW makes
+        // the open fail, so the chmod is never reached and the symlink's
+        // target is never touched — no check-then-act window.
+        let real_target = tmp.path().join("target");
+        std::fs::create_dir(&real_target).unwrap();
+        std::fs::set_permissions(&real_target, std::fs::Permissions::from_mode(0o755)).unwrap();
         let link = tmp.path().join("link");
-        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
-        let err = ensure_not_symlink(&link).unwrap_err();
-        assert!(
-            err.to_string()
-                .contains("refusing to use symlinked temp dir"),
-            "{err}"
-        );
+        std::os::unix::fs::symlink(&real_target, &link).unwrap();
+        let err = create_and_secure_dir_atomic(&link).unwrap_err();
+        assert!(err.to_string().contains("symlink or missing"), "{err}");
+        // The symlink target must be untouched (still 0755, not 0700).
+        let mode = std::fs::metadata(&real_target)
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o755);
     }
 
     #[test]

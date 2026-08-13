@@ -49,6 +49,27 @@ fn debug_transcript_enabled() -> bool {
     std::env::var("WX_CLI_DEBUG_LLDB").map_or(false, |v| v == "1")
 }
 
+/// Refuse symlinked temp-dir components.
+///
+/// `ensure_dir`/`set_permissions` follow symlinks, so on a shared temp dir
+/// another user could pre-create `$TMPDIR/wx-cli` (or a subdir) as a symlink
+/// and redirect our permission changes and file creation to an unexpected
+/// location. Fail closed instead of hardening through a link.
+fn ensure_not_symlink(path: &std::path::Path) -> Result<(), KeychainError> {
+    match std::fs::symlink_metadata(path) {
+        Ok(meta) if meta.file_type().is_symlink() => Err(KeychainError::Other(format!(
+            "refusing to use symlinked temp dir {}",
+            path.display()
+        ))),
+        Ok(_) => Ok(()),
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(KeychainError::Other(format!(
+            "could not inspect temp dir {}: {err}",
+            path.display()
+        ))),
+    }
+}
+
 /// RAII guard: removes the capture script on every exit path, so an early
 /// error (e.g. failing to spawn lldb, missing stdout/stderr pipes) cannot
 /// leave the 0600 script behind. Also fires if the future is cancelled.
@@ -144,6 +165,13 @@ pub async fn capture_key(
     // capture finishes (see cleanup below).
     let script_path = wx_paths::AppPaths::lldb_script_file();
     if let Some(parent) = script_path.parent() {
+        // Reject symlinked components before creating or tightening: another
+        // user on a shared temp dir could pre-create the root (or the lldb
+        // dir) as a symlink, redirecting our chmods and file creation.
+        if let Some(root) = parent.parent() {
+            ensure_not_symlink(root)?;
+        }
+        ensure_not_symlink(parent)?;
         wx_paths::AppPaths::ensure_dir(parent)?;
         // The lldb dir may sit in a shared temp location; make it owner-only
         // so other local users cannot plant symlinks into the capture paths.
@@ -332,35 +360,50 @@ pub async fn capture_key(
     // is written with mode 0600 for debugging; the raw values never hit disk.
     if debug_transcript_enabled() {
         let redacted = redact_sensitive_lines(&output_lines);
+        // Same symlink rejection as the script path (defense in depth: the
+        // shared dirs were already validated above, but the debug path must
+        // never harden or write through a link either). If the dir cannot be
+        // secured, skip the transcript entirely rather than write through a
+        // potentially hostile path.
+        let mut dir_secure = true;
         if let Some(parent) = output_path.parent() {
-            if let Err(err) = wx_paths::AppPaths::ensure_dir(parent) {
-                eprintln!("WARNING: could not create {}: {err}", parent.display());
-            }
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                if let Err(err) =
-                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            if let Err(err) = ensure_not_symlink(parent) {
+                eprintln!("WARNING: {err} — skipping redacted LLDB transcript");
+                dir_secure = false;
+            } else {
+                if let Err(err) = wx_paths::AppPaths::ensure_dir(parent) {
+                    eprintln!("WARNING: could not create {}: {err}", parent.display());
+                }
+                #[cfg(unix)]
                 {
-                    eprintln!(
-                        "WARNING: could not tighten {} to 0700: {err}",
-                        parent.display()
-                    );
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Err(err) =
+                        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                    {
+                        eprintln!(
+                            "WARNING: could not tighten {} to 0700: {err}",
+                            parent.display()
+                        );
+                    }
                 }
             }
         }
-        match write_redacted_transcript(&output_path, &redacted) {
-            Ok(()) => eprintln!(
-                "WX_CLI_DEBUG_LLDB set: redacted LLDB transcript written to {}",
-                output_path.display()
-            ),
-            Err(err) => eprintln!(
-                "WARNING: WX_CLI_DEBUG_LLDB set but could not write redacted transcript to {}: {err}",
-                output_path.display()
-            ),
+        if dir_secure {
+            match write_redacted_transcript(&output_path, &redacted) {
+                Ok(()) => eprintln!(
+                    "WX_CLI_DEBUG_LLDB set: redacted LLDB transcript written to {}",
+                    output_path.display()
+                ),
+                Err(err) => eprintln!(
+                    "WARNING: WX_CLI_DEBUG_LLDB set but could not write redacted transcript to {}: {err}",
+                    output_path.display()
+                ),
+            }
         }
-    } else if output_path.exists() {
-        // Clean up transcripts left by older versions.
+    } else if std::fs::symlink_metadata(&output_path).is_ok() {
+        // Clean up transcripts (or dangling transcript symlinks) left by
+        // older versions; symlink_metadata so the link itself is removed
+        // even when its target no longer exists.
         if let Err(err) = std::fs::remove_file(&output_path) {
             eprintln!(
                 "WARNING: could not remove leftover LLDB transcript {}: {err}",
@@ -463,6 +506,24 @@ mod tests {
 
     /// Serializes env-var mutation across parallel tests.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn symlinked_temp_dir_components_are_rejected() {
+        use super::ensure_not_symlink;
+        let tmp = tempfile::tempdir().unwrap();
+        let real_dir = tmp.path().join("real");
+        std::fs::create_dir(&real_dir).unwrap();
+        assert!(ensure_not_symlink(&real_dir).is_ok());
+        assert!(ensure_not_symlink(&tmp.path().join("missing")).is_ok());
+        let link = tmp.path().join("link");
+        std::os::unix::fs::symlink(&real_dir, &link).unwrap();
+        let err = ensure_not_symlink(&link).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("refusing to use symlinked temp dir"),
+            "{err}"
+        );
+    }
 
     #[test]
     fn debug_transcript_requires_exact_value_1() {

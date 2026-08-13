@@ -161,6 +161,21 @@ pub async fn capture_key(
                     ))
                 },
             )?;
+            // The wx-cli temp root itself must be secured too: if an
+            // attacker pre-created `$TMPDIR/wx-cli` permissively, they could
+            // delete/replace the `lldb/` entry between runs and redirect
+            // capture artifacts, so the lldb-dir tightening alone would not
+            // hold. Fail closed on the whole chain.
+            if let Some(root) = parent.parent() {
+                std::fs::set_permissions(root, std::fs::Permissions::from_mode(0o700)).map_err(
+                    |err| {
+                        KeychainError::Other(format!(
+                            "could not secure wx-cli temp root {} to 0700: {err}",
+                            root.display()
+                        ))
+                    },
+                )?;
+            }
         }
     }
     {

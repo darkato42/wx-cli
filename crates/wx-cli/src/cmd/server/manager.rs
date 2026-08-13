@@ -143,6 +143,9 @@ pub async fn cmd_server_restart(args: ServerRestartArgs) -> Result<(), Box<dyn s
         host: config.host,
         port: config.port,
         token: config.token,
+        no_auth: config.no_auth,
+        cors_origins: config.cors_origins,
+        allowed_hosts: config.allowed_hosts,
         runtime_root: args.runtime_root,
     })
     .await
@@ -309,6 +312,15 @@ fn spawn_worker(
     command.arg("--port").arg(config.port.to_string());
     if let Some(token) = &config.token {
         command.arg("--token").arg(token);
+    }
+    if config.no_auth {
+        command.arg("--no-auth");
+    }
+    for origin in &config.cors_origins {
+        command.arg("--cors-origin").arg(origin);
+    }
+    for host in &config.allowed_hosts {
+        command.arg("--allow-host").arg(host);
     }
 
     #[cfg(unix)]

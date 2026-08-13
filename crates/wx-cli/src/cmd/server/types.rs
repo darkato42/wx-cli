@@ -39,9 +39,35 @@ pub struct ServerRunArgs {
     #[arg(long, default_value = "9100")]
     pub port: u16,
 
-    /// Bearer token for authentication (required when --host is not loopback)
+    /// Bearer token for authentication.
+    ///
+    /// If omitted, a random token is generated and stored in the launch config
+    /// so local `wx-cli` commands keep working transparently. Prefer the
+    /// `WX_CLI_SERVER_TOKEN` environment variable: arguments passed here are
+    /// visible to every local user via `ps`.
     #[arg(long)]
     pub token: Option<String>,
+
+    /// Run with NO authentication at all.
+    ///
+    /// Strongly discouraged: any local process — including any web page your
+    /// browser loads — can then read your entire message history.
+    #[arg(long)]
+    pub no_auth: bool,
+
+    /// Browser origin allowed to read API responses cross-origin (repeatable).
+    ///
+    /// CORS is disabled entirely unless at least one origin is given.
+    #[arg(long = "cors-origin")]
+    pub cors_origins: Vec<String>,
+
+    /// Extra hostname accepted in the `Host` header (repeatable).
+    ///
+    /// Loopback names are always accepted. Any other name is rejected to
+    /// prevent DNS-rebinding attacks; add it here if you front the server with
+    /// a reverse proxy under a different hostname.
+    #[arg(long = "allow-host")]
+    pub allowed_hosts: Vec<String>,
 
     /// Internal runtime root override for tests/non-public plumbing
     #[arg(long, hide = true)]
@@ -107,9 +133,35 @@ pub struct ServerWorkerArgs {
     #[arg(long, default_value = "9100")]
     pub port: u16,
 
-    /// Bearer token for authentication (required when --host is not loopback)
+    /// Bearer token for authentication.
+    ///
+    /// If omitted, a random token is generated and stored in the launch config
+    /// so local `wx-cli` commands keep working transparently. Prefer the
+    /// `WX_CLI_SERVER_TOKEN` environment variable: arguments passed here are
+    /// visible to every local user via `ps`.
     #[arg(long)]
     pub token: Option<String>,
+
+    /// Run with NO authentication at all.
+    ///
+    /// Strongly discouraged: any local process — including any web page your
+    /// browser loads — can then read your entire message history.
+    #[arg(long)]
+    pub no_auth: bool,
+
+    /// Browser origin allowed to read API responses cross-origin (repeatable).
+    ///
+    /// CORS is disabled entirely unless at least one origin is given.
+    #[arg(long = "cors-origin")]
+    pub cors_origins: Vec<String>,
+
+    /// Extra hostname accepted in the `Host` header (repeatable).
+    ///
+    /// Loopback names are always accepted. Any other name is rejected to
+    /// prevent DNS-rebinding attacks; add it here if you front the server with
+    /// a reverse proxy under a different hostname.
+    #[arg(long = "allow-host")]
+    pub allowed_hosts: Vec<String>,
 
     /// Internal runtime root override for tests/non-public plumbing
     #[arg(long, hide = true)]
@@ -146,6 +198,12 @@ pub struct ServerLaunchConfig {
     pub host: String,
     pub port: u16,
     pub token: Option<String>,
+    #[serde(default)]
+    pub no_auth: bool,
+    #[serde(default)]
+    pub cors_origins: Vec<String>,
+    #[serde(default)]
+    pub allowed_hosts: Vec<String>,
 }
 
 impl From<ServerRunArgs> for ServerLaunchConfig {
@@ -160,6 +218,9 @@ impl From<ServerRunArgs> for ServerLaunchConfig {
             host: value.host,
             port: value.port,
             token: value.token,
+            no_auth: value.no_auth,
+            cors_origins: value.cors_origins,
+            allowed_hosts: value.allowed_hosts,
         }
     }
 }
@@ -176,6 +237,9 @@ impl From<ServerWorkerArgs> for ServerLaunchConfig {
             host: value.host,
             port: value.port,
             token: value.token,
+            no_auth: value.no_auth,
+            cors_origins: value.cors_origins,
+            allowed_hosts: value.allowed_hosts,
         }
     }
 }

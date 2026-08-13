@@ -45,6 +45,12 @@ pub struct AppState {
     pub broadcast_tx: broadcast::Sender<Arc<SseEvent>>,
     /// Optional Bearer token for auth.
     pub auth_token: Option<String>,
+    /// Hostnames accepted in the `Host` header beyond loopback literals.
+    /// Populated from `--allow-host`; empty means loopback-only (DNS-rebinding safe).
+    pub allowed_hosts: Vec<String>,
+    /// Browser origins allowed to read API responses cross-origin.
+    /// Populated from `--cors-origin`; empty means CORS headers are not sent at all.
+    pub cors_origins: Vec<String>,
     /// Bridge initialization complete flag. SSE returns 503 until true.
     pub ready: AtomicBool,
     /// Channel for bridge to signal refresh task.

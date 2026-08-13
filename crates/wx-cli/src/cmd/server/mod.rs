@@ -36,6 +36,9 @@ async fn cmd_server_worker(args: ServerWorkerArgs) -> Result<(), Box<dyn std::er
         config.host,
         config.port,
         config.token,
+        config.no_auth,
+        config.cors_origins,
+        config.allowed_hosts,
         args.worker_id,
         Some(reporter),
     )

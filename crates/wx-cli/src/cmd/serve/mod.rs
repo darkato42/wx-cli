@@ -8,6 +8,7 @@ pub(crate) mod refresh;
 mod routes;
 mod state;
 
+use sha2::Digest;
 use std::num::NonZeroUsize;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -307,7 +308,9 @@ pub async fn cmd_serve(
         resolver: Arc::new(resolver),
         visibility: Arc::new(visibility),
         broadcast_tx,
-        auth_token: token.clone(),
+        auth_token_digest: token
+            .as_ref()
+            .map(|t| sha2::Sha256::digest(t.as_bytes()).into()),
         allowed_hosts: allowed_hosts.clone(),
         cors_origins: cors_origins.clone(),
         ready: AtomicBool::new(false),
@@ -499,7 +502,7 @@ pub async fn cmd_serve(
                 host: bg_host.clone(),
                 port,
                 base_url: base_url(&bg_host, port),
-                token_configured: bg_state.auth_token.is_some(),
+                token_configured: bg_state.auth_token_digest.is_some(),
                 cli_version: bg_state.cli_version.clone(),
                 current_account: Some(RuntimeAccountState {
                     wxid: bg_state.current_account.wxid.clone(),
@@ -525,7 +528,7 @@ pub async fn cmd_serve(
                 host: bg_host.clone(),
                 port,
                 base_url: base_url(&bg_host, port),
-                token_configured: bg_state.auth_token.is_some(),
+                token_configured: bg_state.auth_token_digest.is_some(),
                 cli_version: bg_state.cli_version.clone(),
                 current_account: Some(RuntimeAccountState {
                     wxid: bg_state.current_account.wxid.clone(),

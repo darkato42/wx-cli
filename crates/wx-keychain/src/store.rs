@@ -54,6 +54,34 @@ pub struct KeyStore {
     pub accounts: HashMap<String, AccountKey>,
 }
 
+/// Emit a loud warning if a key material file is group- or world-readable.
+///
+/// Files written by this crate are 0600; files created by older versions (or
+/// by a umask override) may be looser. The warning is advisory — the file is
+/// still read, since refusing would lock the user out of their own keys.
+#[cfg(unix)]
+fn warn_if_world_readable(path: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+
+    let Ok(metadata) = fs::metadata(path) else {
+        return;
+    };
+    let mode = metadata.permissions().mode();
+    if mode & 0o077 != 0 {
+        eprintln!(
+            "WARNING: {} is {:o} — group/world readable. It contains WeChat decryption keys.\n\
+             Run `chmod 600 {}` to fix.",
+            path.display(),
+            mode & 0o777,
+            path.display()
+        );
+    }
+}
+
+/// Non-Unix fallback: no permission-bit model to warn about.
+#[cfg(not(unix))]
+fn warn_if_world_readable(_path: &Path) {}
+
 impl KeyStore {
     /// Default path: `<config_dir>/keys.toml`
     pub fn default_path() -> Result<PathBuf, KeychainError> {
@@ -75,6 +103,7 @@ impl KeyStore {
         if !path.exists() {
             return Ok(Self::default());
         }
+        warn_if_world_readable(path);
         let content = fs::read_to_string(path)?;
         toml::from_str(&content)
             .map_err(|e| KeychainError::Store(format!("failed to parse {}: {}", path.display(), e)))
@@ -86,24 +115,103 @@ impl KeyStore {
         self.save(&path)
     }
 
+    /// Open (or recreate) the temp file for an atomic key write.
+    ///
+    /// Uses `create_new` so an existing path is NEVER written into: a stale
+    /// temp left by a crashed run is removed and recreated (fresh inode), and
+    /// a planted symlink/hardlink is refused outright (`O_EXCL` semantics) —
+    /// the link is removed, never followed. On Unix the file is created 0600.
+    fn open_tmp_write_only(tmp_path: &Path) -> std::io::Result<fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(tmp_path)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(tmp_path)
+        }
+    }
+
     /// Save to a specific path, creating parent directories as needed.
     ///
     /// Uses atomic write (write to `.tmp` sibling, then `rename`) to prevent
     /// partial TOML files on crash.
+    ///
+    /// Security: this file holds raw decryption keys, so on Unix it is created
+    /// with mode 0600 (owner read/write only) and the parent directory is
+    /// tightened to 0700. The temp file is opened 0600 *before* any bytes are
+    /// written, so there is no window where a world-readable copy exists on
+    /// disk, and `create_new` guarantees the temp is never a pre-existing
+    /// path (stale temp or planted link).
     pub fn save(&self, path: &Path) -> Result<(), KeychainError> {
         let parent_existed = path.parent().is_none_or(|p| p.exists());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+                    eprintln!(
+                        "WARNING: could not tighten {} to 0700: {err}",
+                        parent.display()
+                    );
+                }
+            }
         }
         let content = toml::to_string_pretty(self)
             .map_err(|e| KeychainError::Store(format!("failed to serialize: {}", e)))?;
 
         let tmp_path = path.with_extension("toml.tmp");
-        fs::write(&tmp_path, &content)?;
+        {
+            let mut file = match Self::open_tmp_write_only(&tmp_path) {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Stale temp from a crashed run (or a planted link):
+                    // remove the name — never follow it — and retry once.
+                    fs::remove_file(&tmp_path)?;
+                    Self::open_tmp_write_only(&tmp_path)?
+                }
+                Err(err) => return Err(err.into()),
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Belt-and-braces: re-assert 0600 (covers umask edge cases).
+                if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                {
+                    eprintln!(
+                        "WARNING: could not tighten {} to 0600: {err}",
+                        tmp_path.display()
+                    );
+                }
+            }
+            use std::io::Write;
+            file.write_all(content.as_bytes())?;
+        }
         fs::rename(&tmp_path, path).inspect_err(|_| {
             // Clean up the temp file on rename failure.
             let _ = fs::remove_file(&tmp_path);
         })?;
+        // Belt-and-braces: the file may pre-exist with looser permissions from
+        // an older version; re-assert 0600 after the rename.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "WARNING: could not tighten {} to 0600: {err}",
+                    path.display()
+                );
+            }
+        }
 
         wx_paths::sudo::chown_to_sudo_user(path);
         if !parent_existed {
@@ -355,6 +463,94 @@ impl KeyStore {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[test]
+    fn saved_keys_file_is_0600_and_dir_0700() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("nested").join("keys.toml");
+        let mut store = KeyStore::default();
+        store.set("wxid_perm_test", &"ab".repeat(32), "4.1.7.31", None, None);
+        store.save(&path).unwrap();
+
+        let file_mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            file_mode & 0o777,
+            0o600,
+            "keys file must be 0600, got {file_mode:o}"
+        );
+
+        let dir_mode = fs::metadata(path.parent().unwrap())
+            .unwrap()
+            .permissions()
+            .mode();
+        assert_eq!(
+            dir_mode & 0o777,
+            0o700,
+            "keys dir must be 0700, got {dir_mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_over_existing_permissive_file_tightens_permissions() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keys.toml");
+        // Simulate a file written by an older version with loose perms.
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o644)
+            .open(&path)
+            .unwrap();
+        let mut store = KeyStore::default();
+        store.set("wxid_perm_test", &"ab".repeat(32), "4.1.7.31", None, None);
+        store.save(&path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "save must tighten to 0600, got {mode:o}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn save_tightens_stale_permissive_temp_file() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keys.toml");
+        // Simulate a temp file left by a crashed run with loose perms:
+        // `.mode(0o600)` at open only applies at creation, so the stale file
+        // must be re-tightened before keys are written into it.
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o644)
+            .open(path.with_extension("toml.tmp"))
+            .unwrap();
+
+        let mut store = KeyStore::default();
+        store.set("wxid_perm_test", &"ab".repeat(32), "4.1.7.31", None, None);
+        store.save(&path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "save must tighten to 0600, got {mode:o}"
+        );
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            "temp file must be renamed away"
+        );
+    }
 
     #[test]
     fn test_old_keys_toml_without_nickname_base_wxid() {

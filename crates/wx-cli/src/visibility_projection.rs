@@ -62,6 +62,59 @@ pub fn project_contacts_envelope(
     })
 }
 
+/// Filter search hits against the visibility index.
+///
+/// A hit is removed when its **talker** (the session it lives in) is a
+/// hidden person, or its **sender** is a hidden person posting inside an
+/// otherwise-visible group chat (same group-aware rule as message/session
+/// projection: `is_hidden_sender_in_group`). Sender-level hiding must not
+/// apply in private (non-group) chats, where the talker check already
+/// covers hiding the conversation.
+///
+/// Currently only exercised via unit tests; production call sites use
+/// `project_search_hits_raw` directly so enrichment happens after paging.
+#[allow(dead_code)]
+pub fn project_search_hits(
+    hits: Vec<crate::schema::SearchHit>,
+    visibility: &VisibilityIndex,
+    show_hidden: bool,
+) -> Vec<crate::schema::SearchHit> {
+    project_search_hits_raw(
+        hits,
+        visibility,
+        show_hidden,
+        |hit| &hit.talker,
+        |hit| &hit.sender,
+    )
+}
+
+/// Filter any collection of search hits against the visibility index,
+/// without requiring the hit type to already be enriched to `SearchHit`.
+/// Used to filter native-FTS hits BEFORE display-name resolution so the
+/// (potentially expensive) enrichment only runs on the page actually
+/// returned, not the full MAX_QUERY_LIMIT window.
+///
+/// Same rule as [`project_search_hits`]: drop hits whose talker is hidden,
+/// or whose sender is hidden inside an otherwise-visible group chat.
+pub fn project_search_hits_raw<T>(
+    hits: Vec<T>,
+    visibility: &VisibilityIndex,
+    show_hidden: bool,
+    talker_of: impl Fn(&T) -> &str,
+    sender_of: impl Fn(&T) -> &str,
+) -> Vec<T> {
+    if show_hidden {
+        return hits;
+    }
+    hits.into_iter()
+        .filter(|hit| {
+            let talker = talker_of(hit);
+            !visibility.is_hidden_talker(talker)
+                && !visibility.is_hidden_sender_in_group(talker, sender_of(hit))
+        })
+        .collect()
+}
+
 #[allow(dead_code)]
 pub fn project_sessions_envelope<T>(
     sessions: Vec<T>,
@@ -137,6 +190,69 @@ mod tests {
         assert_eq!(envelope.paging.offset, 1);
         assert!(!envelope.paging.has_more);
         assert_eq!(envelope.stats.scanned, 3);
+    }
+
+    fn search_hit(sender: &str, talker: &str) -> crate::schema::SearchHit {
+        crate::schema::SearchHit {
+            server_id: 1,
+            talker: talker.to_string(),
+            talker_display_name: talker.to_string(),
+            sender: sender.to_string(),
+            sender_display_name: sender.to_string(),
+            direction: wx_context::Direction::Incoming,
+            create_time: 1,
+            sort_seq: 1,
+            msg_type: 1,
+            sub_type: 0,
+            snippet: "snippet".to_string(),
+            hit_type: "Message".to_string(),
+        }
+    }
+
+    #[test]
+    fn empty_sender_is_never_treated_as_hidden() {
+        // A hit whose sender failed to resolve (empty string) must not be
+        // filtered just because the hidden set exists.
+        let hidden = wx_context::VisibilityIndex::build(
+            &["wxid_spam".to_string()],
+            &[],
+            &wx_context::ContactResolver::empty(),
+        );
+        let hits = vec![
+            // Empty sender in a private (non-group) chat: must survive.
+            search_hit("", "wxid_alice"),
+            // Hidden sender, but talker is a private chat (not a group) —
+            // sender-level hiding is group-only, so this must survive too.
+            search_hit("wxid_spam", "wxid_alice"),
+            // Talker itself is hidden: filtered regardless of sender.
+            search_hit("wxid_bob", "wxid_spam"),
+        ];
+        let visible = project_search_hits(hits, &hidden, false);
+        assert_eq!(visible.len(), 2, "only the hidden-talker hit is dropped");
+        assert_eq!(visible[0].sender, "");
+        assert_eq!(visible[0].talker, "wxid_alice");
+        assert_eq!(visible[1].sender, "wxid_spam");
+        assert_eq!(visible[1].talker, "wxid_alice");
+    }
+
+    #[test]
+    fn hidden_sender_in_visible_group_is_filtered() {
+        // Group-aware sender hiding: a hidden person posting inside an
+        // otherwise-visible group chat is filtered at the sender level,
+        // mirroring is_hidden_sender_in_group used by message/session
+        // projection.
+        let hidden = wx_context::VisibilityIndex::build(
+            &["wxid_spam".to_string()],
+            &[],
+            &wx_context::ContactResolver::empty(),
+        );
+        let hits = vec![
+            search_hit("wxid_spam", "group1@chatroom"),
+            search_hit("wxid_visible", "group1@chatroom"),
+        ];
+        let visible = project_search_hits(hits, &hidden, false);
+        assert_eq!(visible.len(), 1);
+        assert_eq!(visible[0].sender, "wxid_visible");
     }
 
     #[test]

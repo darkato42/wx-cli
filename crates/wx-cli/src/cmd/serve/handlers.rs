@@ -686,6 +686,49 @@ pub struct SearchParams {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    /// `1`/`true` to include results from hidden contacts (parity with the
+    /// sessions/contacts endpoints). Default: hidden persons are excluded.
+    #[serde(default)]
+    show_hidden: Option<String>,
+}
+
+/// A search hit not yet resolved to display names — either from the
+/// native FTS index or from the row-scan fallback. Kept unenriched so
+/// visibility filtering and paging can run before the (comparatively
+/// expensive) display-name resolution, which should only be done for the
+/// page actually returned.
+enum RawSearchHit {
+    Native(wx_db::native_fts::NativeFtsHit),
+    Scanned(wx_db::Message, String),
+}
+
+impl RawSearchHit {
+    fn talker(&self) -> &str {
+        match self {
+            RawSearchHit::Native(hit) => &hit.talker,
+            RawSearchHit::Scanned(_, talker) => talker,
+        }
+    }
+
+    fn sender(&self) -> &str {
+        match self {
+            RawSearchHit::Native(hit) => &hit.sender,
+            RawSearchHit::Scanned(msg, _) => &msg.sender,
+        }
+    }
+
+    fn enrich(
+        self,
+        self_wxid: &str,
+        resolver: &wx_context::ContactResolver,
+    ) -> crate::schema::SearchHit {
+        match self {
+            RawSearchHit::Native(hit) => enrich_native_fts_hit(hit, self_wxid, resolver),
+            RawSearchHit::Scanned(msg, talker) => {
+                enrich_message_as_hit(msg, talker, self_wxid, resolver)
+            }
+        }
+    }
 }
 
 pub async fn handler_search(
@@ -700,12 +743,14 @@ pub async fn handler_search(
     let self_wxid = state.self_wxid.clone();
     let limit = wx_db::effective_limit(params.limit);
     let offset = params.offset;
+    let show_hidden = matches!(params.show_hidden.as_deref(), Some("1") | Some("true"));
 
     // Phase 1: Try native FTS using the independent connection (NO main DB lock).
     let fts_conn = state.fts_conn.clone();
     let q_clone = q.clone();
     let resolver_clone = Arc::clone(&resolver);
     let self_wxid_clone = self_wxid.clone();
+    let visibility_clone = Arc::clone(&state.visibility);
     let state_arc = Arc::clone(&state);
 
     let native_result: Option<Result<JsonEnvelope<_>, ServeError>> = if let Some(fts_mutex) =
@@ -734,21 +779,39 @@ pub async fn handler_search(
             match wx_db::native_fts::search_message_fts_with_cache(
                 &fts_guard,
                 &q_clone,
-                limit,
-                offset,
+                wx_db::MAX_QUERY_LIMIT,
+                0,
                 Some(&name2id),
             ) {
                 Ok(result) => {
-                    let total = result.total_hits;
-                    let items: Vec<_> = result
-                        .hits
+                    // Contact hiding applies to search results too: filter
+                    // the RAW hits (talker/sender only, no display-name
+                    // resolution yet) before paging, then enrich only the
+                    // page that will actually be returned — enriching the
+                    // full MAX_QUERY_LIMIT window regardless of page size
+                    // would resolve up to 20k display names per request for
+                    // common search terms. Filtering before limit/offset
+                    // keeps total/has_more exact for the visible set and
+                    // never leaks hidden counts into paging fields.
+                    let visible_hits = crate::visibility_projection::project_search_hits_raw(
+                        result.hits,
+                        &visibility_clone,
+                        show_hidden,
+                        |hit| &hit.talker,
+                        |hit| &hit.sender,
+                    );
+                    let total = visible_hits.len();
+                    let start = offset.min(total);
+                    let page: Vec<_> = visible_hits
                         .into_iter()
+                        .skip(start)
+                        .take(limit)
                         .map(|hit| enrich_native_fts_hit(hit, &self_wxid_clone, &resolver_clone))
                         .collect();
-                    let returned = items.len();
-                    let has_more = offset + returned < total;
+                    let returned = page.len();
+                    let has_more = start + returned < total;
                     Ok(JsonEnvelope {
-                        items,
+                        items: page,
                         paging: crate::output::PagingMeta {
                             limit,
                             offset,
@@ -787,6 +850,7 @@ pub async fn handler_search(
 
     // Phase 2: Scan fallback — requires main DB lock.
     let db = Arc::clone(&state.db);
+    let visibility_scan = Arc::clone(&state.visibility);
     let result = tokio::task::spawn_blocking(move || {
         let mut guard = db.lock().map_err(|e| ServeError::Internal(e.to_string()))?;
 
@@ -796,7 +860,9 @@ pub async fn handler_search(
             let first_attempt = guard
                 .pool()
                 .and_then(|pool| pool.fts_conn())
-                .map(|fts_conn| wx_db::native_fts::search_message_fts(fts_conn, &q, limit, offset));
+                .map(|fts_conn| {
+                    wx_db::native_fts::search_message_fts(fts_conn, &q, wx_db::MAX_QUERY_LIMIT, 0)
+                });
 
             match first_attempt {
                 Some(Ok(r)) => Some(r),
@@ -811,7 +877,10 @@ pub async fn handler_search(
                                 .and_then(|pool| pool.fts_conn())
                                 .and_then(|fts_conn| {
                                     match wx_db::native_fts::search_message_fts(
-                                        fts_conn, &q, limit, offset,
+                                        fts_conn,
+                                        &q,
+                                        wx_db::MAX_QUERY_LIMIT,
+                                        0,
                                     ) {
                                         Ok(r) => Some(r),
                                         Err(e2) => {
@@ -837,21 +906,15 @@ pub async fn handler_search(
             }
         };
 
-        let (hits, total_hits, scan_scanned, scan_skipped, shard_warnings): (
-            Vec<_>,
-            usize,
+        let (hits, scan_scanned, scan_skipped, shard_warnings): (
+            Vec<RawSearchHit>,
             usize,
             usize,
             Vec<wx_db::ShardWarning>,
         ) = match native_result {
             Some(result) => {
-                let total = result.total_hits;
-                let items = result
-                    .hits
-                    .into_iter()
-                    .map(|hit| enrich_native_fts_hit(hit, &self_wxid, &resolver))
-                    .collect();
-                (items, total, 0, 0, Vec::new())
+                let items = result.hits.into_iter().map(RawSearchHit::Native).collect();
+                (items, 0, 0, Vec::new())
             }
             None => {
                 // Scan fallback: iterate all sessions and search by keyword.
@@ -905,32 +968,46 @@ pub async fn handler_search(
                         .then_with(|| b.0.server_id.cmp(&a.0.server_id))
                 });
 
-                let total = all_hits.len();
-                let page: Vec<_> = all_hits.into_iter().skip(offset).take(limit).collect();
-                let enriched: Vec<_> = page
+                let items = all_hits
                     .into_iter()
-                    .map(|(m, talker)| enrich_message_as_hit(m, talker, &self_wxid, &resolver))
+                    .map(|(msg, talker)| RawSearchHit::Scanned(msg, talker))
                     .collect();
-                (
-                    enriched,
-                    total,
-                    total_scanned,
-                    total_skipped,
-                    all_shard_warnings,
-                )
+                (items, total_scanned, total_skipped, all_shard_warnings)
             }
         };
 
-        let returned = hits.len();
-        let has_more = offset + returned < total_hits;
+        // Contact hiding applies to search results: filter the RAW hits
+        // (talker/sender only, no display-name resolution yet) before
+        // enriching, then enrich only the page that will actually be
+        // returned — enriching the full MAX_QUERY_LIMIT scan window
+        // regardless of page size would resolve display names for up to
+        // 20k hits per request. Filtering before limit/offset keeps
+        // total/has_more exact for the visible set.
+        let visible_hits: Vec<RawSearchHit> = crate::visibility_projection::project_search_hits_raw(
+            hits,
+            &visibility_scan,
+            show_hidden,
+            |hit| hit.talker(),
+            |hit| hit.sender(),
+        );
+        let total = visible_hits.len();
+        let start = offset.min(total);
+        let items: Vec<_> = visible_hits
+            .into_iter()
+            .skip(start)
+            .take(limit)
+            .map(|hit| hit.enrich(&self_wxid, &resolver))
+            .collect();
+        let returned = items.len();
+        let has_more = start + returned < total;
         let envelope = JsonEnvelope {
-            items: hits,
+            items,
             paging: crate::output::PagingMeta {
                 limit,
                 offset,
                 returned,
                 has_more,
-                total: total_hits,
+                total,
             },
             stats: crate::output::StatsMeta {
                 scanned: scan_scanned,

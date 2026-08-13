@@ -322,6 +322,82 @@ fn serve_media_headers_file_attachment_and_range() {
     assert_eq!(range_response.header("content-range"), Some("bytes 0-4/23"));
 }
 
+// ---------------------------------------------------------------------------
+// Search visibility (contact hiding applies to /api/v1/search)
+// ---------------------------------------------------------------------------
+
+/// Hits authored by a hidden sender must be filtered out of search results.
+#[test]
+fn search_excludes_hits_from_hidden_sender() {
+    let server = spawn_test_server_with_hidden_contacts(&[HIDDEN_SENDER]);
+    let response = http_get(&server.base_url, "/api/v1/search?q=hiddenplans");
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(
+        !body.contains("hiddenplans"),
+        "hidden sender's message must not appear in search: {body}"
+    );
+    // The response is a valid empty envelope.
+    assert!(body.contains(r#""items":[]"#), "{body}");
+}
+
+/// show_hidden=1 restores parity with the sessions/contacts endpoints.
+#[test]
+fn search_show_hidden_includes_hits_from_hidden_sender() {
+    let server = spawn_test_server_with_hidden_contacts(&[HIDDEN_SENDER]);
+    let response = http_get(
+        &server.base_url,
+        "/api/v1/search?q=hiddenplans&show_hidden=1",
+    );
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(
+        body.contains("hiddenplans"),
+        "show_hidden=1 should include hidden sender's message: {body}"
+    );
+}
+
+/// Regression: visible senders' messages still searchable.
+#[test]
+fn search_still_returns_visible_sender_messages() {
+    let server = spawn_test_server_with_hidden_contacts(&[HIDDEN_SENDER]);
+    let response = http_get(&server.base_url, "/api/v1/search?q=plain");
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(
+        body.contains("plain text"),
+        "visible sender's message must remain searchable: {body}"
+    );
+}
+
+/// Paging fields must describe the visible set exactly: hidden hits are
+/// filtered BEFORE limit/offset, so total/has_more stay accurate and hidden
+/// counts never leak into paging fields.
+#[test]
+fn search_paging_totals_reflect_visible_set() {
+    let server = spawn_test_server_with_hidden_contacts(&[HIDDEN_SENDER]);
+    // q=plans matches two visible messages + one hidden-sender message.
+    let response = http_get(&server.base_url, "/api/v1/search?q=plans&limit=1&offset=0");
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(body.contains("paging plans beta"), "{body}");
+    assert!(body.contains(r#""total":2"#), "{body}");
+    assert!(body.contains(r#""has_more":true"#), "{body}");
+    assert!(body.contains(r#""returned":1"#), "{body}");
+
+    let response = http_get(&server.base_url, "/api/v1/search?q=plans&limit=1&offset=1");
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(body.contains("paging plans alpha"), "{body}");
+    assert!(body.contains(r#""has_more":false"#), "{body}");
+
+    // show_hidden=1 restores the full count (hidden hit included).
+    let response = http_get(&server.base_url, "/api/v1/search?q=plans&show_hidden=1");
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(body.contains(r#""total":3"#), "{body}");
+}
+
 fn spawn_test_server() -> TestServer {
     spawn_test_server_with_env(&[])
 }
@@ -582,17 +658,34 @@ fn create_encrypted_session_db(path: &Path, raw_key: &[u8; 32]) {
         "CREATE TABLE SessionTable (
             username TEXT,
             sort_timestamp INTEGER,
-            summary TEXT
+            summary TEXT,
+            last_msg_type INTEGER,
+            last_msg_sender TEXT,
+            last_sender_display_name TEXT
         );",
         |conn| {
             conn.execute(
-                "INSERT INTO SessionTable VALUES (?1, ?2, ?3)",
-                params![TALKER, 1_700_000_000_i64, "fixture summary"],
+                "INSERT INTO SessionTable VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    TALKER,
+                    1_700_000_000_i64,
+                    "fixture summary",
+                    1_i64,
+                    TALKER,
+                    "Alice"
+                ],
             )
             .expect("insert session");
             conn.execute(
-                "INSERT INTO SessionTable VALUES (?1, ?2, ?3)",
-                params![GROUP_TALKER, 1_700_000_001_i64, "group summary"],
+                "INSERT INTO SessionTable VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    GROUP_TALKER,
+                    1_700_000_001_i64,
+                    "group summary",
+                    1_i64,
+                    GROUP_TALKER,
+                    "Group"
+                ],
             )
             .expect("insert group session");
         },
@@ -856,6 +949,62 @@ fn create_encrypted_message_db(path: &Path, raw_key: &[u8; 32]) {
                 ],
             )
             .expect("insert video message");
+
+            // Message authored by the HIDDEN_SENDER (real_sender_id 3) inside
+            // GROUP_TALKER's *visible* group session. Used by the
+            // search-visibility tests: the group is not hidden, but the
+            // sender is, so search hits from this message must be filtered
+            // (group-aware sender hiding, matching
+            // VisibilityIndex::is_hidden_sender_in_group used everywhere
+            // else) unless show_hidden=1. Private (non-group) chats do NOT
+            // apply sender-level hiding — hiding a 1:1 contact hides the
+            // whole talker instead, so this fixture intentionally lives in
+            // the group table, not the private-chat table.
+            conn.execute(
+                &format!(
+                    "INSERT INTO [{group_table}] VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    group_table = GROUP_MSG_TABLE
+                ),
+                params![
+                    600_i64,
+                    3101_i64,
+                    1_i64,
+                    3_i64, // HIDDEN_SENDER
+                    1_709_251_300_i64,
+                    b"hiddenplans briefing" as &[u8],
+                    None::<Vec<u8>>,
+                    0_i32,
+                    None::<i32>,
+                ],
+            )
+            .expect("insert hidden-sender message");
+
+            // Two visible text messages sharing the "plans" keyword, so the
+            // paging tests can exercise total/has_more against a multi-hit
+            // result set that also contains a hidden-sender hit.
+            for (sort_seq, server_id, content) in [
+                (500_i64, 2004_i64, b"paging plans beta" as &[u8]),
+                (400_i64, 2005_i64, b"paging plans alpha" as &[u8]),
+            ] {
+                conn.execute(
+                    &format!(
+                        "INSERT INTO [{table}] VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                        table = MSG_TABLE
+                    ),
+                    params![
+                        sort_seq,
+                        server_id,
+                        1_i64,
+                        1_i64, // TALKER
+                        1_709_251_200_i64 + sort_seq,
+                        content,
+                        None::<Vec<u8>>,
+                        0_i32,
+                        None::<i32>,
+                    ],
+                )
+                .expect("insert plans message");
+            }
 
             let video_info_msg_video = encode_packed_info_for_test(None, Some("vid002"));
             conn.execute(

@@ -46,7 +46,7 @@ fn open_write_0600(path: &std::path::Path) -> std::io::Result<std::fs::File> {
 /// Only the exact value `1` enables it: `WX_CLI_DEBUG_LLDB=0` (or any other
 /// value) must not accidentally persist key-derived material.
 fn debug_transcript_enabled() -> bool {
-    std::env::var("WX_CLI_DEBUG_LLDB").map_or(false, |v| v == "1")
+    std::env::var("WX_CLI_DEBUG_LLDB").is_ok_and(|v| v == "1")
 }
 
 /// Whether an open failure should be treated as "the name exists" and retried

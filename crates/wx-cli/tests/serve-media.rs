@@ -362,6 +362,10 @@ fn spawn_test_server_with_setup(envs: &[(&str, &str)], hidden_contacts: &[&str])
             "--poll",
             "--poll-ms",
             "1000",
+            // Auth is on by default now; these tests exercise media/visibility
+            // behaviour, not authentication. Dedicated auth coverage lives in
+            // tests/serve-security.rs.
+            "--no-auth",
             "--runtime-root",
             runtime_root.to_str().expect("runtime root utf8"),
         ])

@@ -16,6 +16,65 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_wx-cli")
 }
 
+/// Worker logs can carry the auth token, so they must be 0600 — including
+/// when an older version already created them with broader permissions.
+#[test]
+fn worker_logs_are_tightened_to_0600_even_if_preexisting() {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let fixture = create_fixture();
+    let runtime_root = fixture.path().join("runtime");
+    let _guard = ManagedServerGuard::new(runtime_root.clone());
+    let account_dir = fixture.path().join(TEST_ACCOUNT_ID);
+    let port = find_open_port();
+
+    // Simulate logs left behind by an older version with world-readable perms.
+    fs::create_dir_all(&runtime_root).expect("create runtime root");
+    for name in ["stdout.log", "stderr.log"] {
+        let path = runtime_root.join(name);
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o644)
+            .open(&path)
+            .expect("pre-create permissive log");
+    }
+
+    let run = Command::new(bin())
+        .args([
+            "server",
+            "run",
+            "--data-dir",
+            account_dir.to_str().expect("fixture path utf8"),
+            "--key",
+            TEST_KEY_HEX,
+            "--host",
+            "127.0.0.1",
+            "--port",
+            &port.to_string(),
+            "--poll",
+            "--poll-ms",
+            "1000",
+            "--runtime-root",
+            runtime_root.to_str().expect("runtime root utf8"),
+        ])
+        .output()
+        .expect("run server");
+    assert_runtime_success(&run, &runtime_root);
+
+    for name in ["stdout.log", "stderr.log"] {
+        let mode = fs::metadata(runtime_root.join(name))
+            .expect("log metadata")
+            .permissions()
+            .mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "{name} must be 0600 after run, got {mode:o}"
+        );
+    }
+}
+
 #[test]
 fn help_surface_exposes_server_group_only() {
     let root_help = Command::new(bin())

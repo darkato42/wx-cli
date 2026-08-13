@@ -36,6 +36,17 @@ pub(crate) fn is_loopback(host: &str) -> bool {
     matches!(host, "127.0.0.1" | "::1" | "localhost")
 }
 
+/// Generate a random 256-bit bearer token, hex encoded.
+///
+/// Uses the OS CSPRNG via `getrandom` (re-exported by `rand`), so the token is
+/// not predictable from process state or start time.
+pub(crate) fn generate_auth_token() -> String {
+    use rand::RngCore;
+    let mut bytes = [0u8; 32];
+    rand::rngs::OsRng.fill_bytes(&mut bytes);
+    hex::encode(bytes)
+}
+
 fn resolve_watch_mode(poll: bool, fsnotify: bool) -> wx_monitor::WatchMode {
     if poll {
         wx_monitor::WatchMode::Poll
@@ -57,13 +68,42 @@ pub async fn cmd_serve(
     host: String,
     port: u16,
     token: Option<String>,
+    no_auth: bool,
+    cors_origins: Vec<String>,
+    allowed_hosts: Vec<String>,
     worker_id: Option<String>,
     runtime_reporter: Option<RuntimeReporter>,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    // Security check: require token when binding to non-loopback
-    if !is_loopback(&host) && token.is_none() {
+    // Security check: require a token when binding to a non-loopback interface.
+    // `--no-auth` cannot waive this: an unauthenticated server on a routable
+    // interface exposes the user's entire message history to the network.
+    if !is_loopback(&host) && (token.is_none() || no_auth) {
         return Err("--token is required when --host is not loopback".into());
     }
+
+    // Authentication is now on by default, including on loopback.
+    //
+    // Loopback is NOT a trust boundary: every process running as this user, and
+    // every web page the user's browser loads, can reach 127.0.0.1. Running
+    // without a token previously let any visited website read the full chat
+    // history via a plain `fetch()`. When no token is supplied we generate one
+    // rather than silently disabling auth.
+    let token = if no_auth {
+        eprintln!(
+            "wx-cli: WARNING --no-auth is set. The API is UNAUTHENTICATED; any local process \n\
+             (including any website open in your browser) can read your entire message history."
+        );
+        None
+    } else {
+        match token {
+            Some(t) => Some(t),
+            None => {
+                let generated = generate_auth_token();
+                eprintln!("wx-cli: no --token supplied; generated one for this session.");
+                Some(generated)
+            }
+        }
+    };
 
     let t_total = Instant::now();
     let params = &wx_decrypt::MACOS_4_1_7_31;
@@ -268,6 +308,8 @@ pub async fn cmd_serve(
         visibility: Arc::new(visibility),
         broadcast_tx,
         auth_token: token.clone(),
+        allowed_hosts: allowed_hosts.clone(),
+        cors_origins: cors_origins.clone(),
         ready: AtomicBool::new(false),
         refresh_tx: refresh_tx.clone(),
         shutdown: shutdown.clone(),
@@ -308,8 +350,25 @@ pub async fn cmd_serve(
     let auth_status = if token.is_some() {
         "Bearer token required"
     } else {
-        "disabled"
+        "DISABLED (--no-auth)"
     };
+    // Only print the token on direct invocation. Under `wx-cli server run` the
+    // manager passes it via WX_CLI_WORKER_TOKEN and persists it in the 0600
+    // secrets file; printing it here would write the secret into the
+    // persistent stderr log.
+    if let Some(ref t) = token {
+        if std::env::var_os("WX_CLI_WORKER_TOKEN").is_none() {
+            eprintln!("wx-cli: auth token: {t}");
+            eprintln!(
+                "  Use: curl -H 'Authorization: Bearer {t}' http://{bind_addr}/api/v1/health"
+            );
+        }
+    }
+    if cors_origins.is_empty() {
+        eprintln!("  CORS: disabled (no browser origin may read responses)");
+    } else {
+        eprintln!("  CORS: allowed origins: {}", cors_origins.join(", "));
+    }
     eprintln!("wx-cli server worker: listening on http://{bind_addr}");
     eprintln!("  SSE endpoint: GET /api/v1/events");
     eprintln!("  REST endpoints:");

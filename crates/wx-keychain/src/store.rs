@@ -125,7 +125,12 @@ impl KeyStore {
         let parent_existed = path.parent().is_none_or(|p| p.exists());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
-            let _ = fs::set_permissions(parent, fs::Permissions::from_mode(0o700));
+            if let Err(err) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+                eprintln!(
+                    "WARNING: could not tighten {} to 0700: {err}",
+                    parent.display()
+                );
+            }
         }
         let content = toml::to_string_pretty(self)
             .map_err(|e| KeychainError::Store(format!("failed to serialize: {}", e)))?;
@@ -138,6 +143,16 @@ impl KeyStore {
                 .write(true)
                 .mode(0o600)
                 .open(&tmp_path)?;
+            // `.mode(0o600)` only applies at creation: a stale temp left by a
+            // crashed earlier run keeps its old (possibly 0644) mode. Tighten
+            // right after open so keys are never written into a permissive
+            // file, even mid-window before the rename.
+            if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "WARNING: could not tighten {} to 0600: {err}",
+                    tmp_path.display()
+                );
+            }
             use std::io::Write;
             file.write_all(content.as_bytes())?;
         }
@@ -147,7 +162,12 @@ impl KeyStore {
         })?;
         // Belt-and-braces: the file may pre-exist with looser permissions from
         // an older version; re-assert 0600 after the rename.
-        let _ = fs::set_permissions(path, fs::Permissions::from_mode(0o600));
+        if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+            eprintln!(
+                "WARNING: could not tighten {} to 0600: {err}",
+                path.display()
+            );
+        }
 
         wx_paths::sudo::chown_to_sudo_user(path);
         if !parent_existed {
@@ -450,6 +470,38 @@ mod tests {
             mode & 0o777,
             0o600,
             "save must tighten to 0600, got {mode:o}"
+        );
+    }
+
+    #[test]
+    fn save_tightens_stale_permissive_temp_file() {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("keys.toml");
+        // Simulate a temp file left by a crashed run with loose perms:
+        // `.mode(0o600)` at open only applies at creation, so the stale file
+        // must be re-tightened before keys are written into it.
+        fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .mode(0o644)
+            .open(path.with_extension("toml.tmp"))
+            .unwrap();
+
+        let mut store = KeyStore::default();
+        store.set("wxid_perm_test", &"ab".repeat(32), "4.1.7.31", None, None);
+        store.save(&path).unwrap();
+
+        let mode = fs::metadata(&path).unwrap().permissions().mode();
+        assert_eq!(
+            mode & 0o777,
+            0o600,
+            "save must tighten to 0600, got {mode:o}"
+        );
+        assert!(
+            !path.with_extension("toml.tmp").exists(),
+            "temp file must be renamed away"
         );
     }
 

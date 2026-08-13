@@ -46,7 +46,10 @@ pub async fn cmd_key_extract(
     if print_key {
         println!("{hex_key}");
     } else {
-        eprintln!("Key not printed to stdout; use --print-key to show it.");
+        eprintln!(
+            "Key not printed to stdout; use --print-key to show it. \
+             (Saved to the keystore below once capture finishes successfully.)"
+        );
     }
 
     let nickname = wx_keychain::resolve_nickname(

@@ -62,6 +62,26 @@ pub fn project_contacts_envelope(
     })
 }
 
+/// Filter search hits against the visibility index.
+///
+/// A hit is removed when its **talker** (the session it lives in) or its
+/// **sender** (the authoring wxid) is a hidden person. Sender-level filtering
+/// matters for group chats where a hidden person posts inside a visible group.
+pub fn project_search_hits(
+    hits: Vec<crate::schema::SearchHit>,
+    visibility: &VisibilityIndex,
+    show_hidden: bool,
+) -> Vec<crate::schema::SearchHit> {
+    if show_hidden {
+        return hits;
+    }
+    hits.into_iter()
+        .filter(|hit| {
+            !visibility.is_hidden_talker(&hit.talker) && !visibility.is_hidden_talker(&hit.sender)
+        })
+        .collect()
+}
+
 #[allow(dead_code)]
 pub fn project_sessions_envelope<T>(
     sessions: Vec<T>,

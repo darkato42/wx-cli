@@ -322,6 +322,54 @@ fn serve_media_headers_file_attachment_and_range() {
     assert_eq!(range_response.header("content-range"), Some("bytes 0-4/23"));
 }
 
+// ---------------------------------------------------------------------------
+// Search visibility (contact hiding applies to /api/v1/search)
+// ---------------------------------------------------------------------------
+
+/// Hits authored by a hidden sender must be filtered out of search results.
+#[test]
+fn search_excludes_hits_from_hidden_sender() {
+    let server = spawn_test_server_with_hidden_contacts(&[HIDDEN_SENDER]);
+    let response = http_get(&server.base_url, "/api/v1/search?q=hiddenplans");
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(
+        !body.contains("hiddenplans"),
+        "hidden sender's message must not appear in search: {body}"
+    );
+    // The response is a valid empty envelope.
+    assert!(body.contains(r#""items":[]"#), "{body}");
+}
+
+/// show_hidden=1 restores parity with the sessions/contacts endpoints.
+#[test]
+fn search_show_hidden_includes_hits_from_hidden_sender() {
+    let server = spawn_test_server_with_hidden_contacts(&[HIDDEN_SENDER]);
+    let response = http_get(
+        &server.base_url,
+        "/api/v1/search?q=hiddenplans&show_hidden=1",
+    );
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(
+        body.contains("hiddenplans"),
+        "show_hidden=1 should include hidden sender's message: {body}"
+    );
+}
+
+/// Regression: visible senders' messages still searchable.
+#[test]
+fn search_still_returns_visible_sender_messages() {
+    let server = spawn_test_server_with_hidden_contacts(&[HIDDEN_SENDER]);
+    let response = http_get(&server.base_url, "/api/v1/search?q=plain");
+    assert_eq!(response.status_code, 200, "{response:#?}");
+    let body = String::from_utf8_lossy(&response.body);
+    assert!(
+        body.contains("plain text"),
+        "visible sender's message must remain searchable: {body}"
+    );
+}
+
 fn spawn_test_server() -> TestServer {
     spawn_test_server_with_env(&[])
 }
@@ -582,17 +630,34 @@ fn create_encrypted_session_db(path: &Path, raw_key: &[u8; 32]) {
         "CREATE TABLE SessionTable (
             username TEXT,
             sort_timestamp INTEGER,
-            summary TEXT
+            summary TEXT,
+            last_msg_type INTEGER,
+            last_msg_sender TEXT,
+            last_sender_display_name TEXT
         );",
         |conn| {
             conn.execute(
-                "INSERT INTO SessionTable VALUES (?1, ?2, ?3)",
-                params![TALKER, 1_700_000_000_i64, "fixture summary"],
+                "INSERT INTO SessionTable VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    TALKER,
+                    1_700_000_000_i64,
+                    "fixture summary",
+                    1_i64,
+                    TALKER,
+                    "Alice"
+                ],
             )
             .expect("insert session");
             conn.execute(
-                "INSERT INTO SessionTable VALUES (?1, ?2, ?3)",
-                params![GROUP_TALKER, 1_700_000_001_i64, "group summary"],
+                "INSERT INTO SessionTable VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    GROUP_TALKER,
+                    1_700_000_001_i64,
+                    "group summary",
+                    1_i64,
+                    GROUP_TALKER,
+                    "Group"
+                ],
             )
             .expect("insert group session");
         },
@@ -856,6 +921,29 @@ fn create_encrypted_message_db(path: &Path, raw_key: &[u8; 32]) {
                 ],
             )
             .expect("insert video message");
+
+            // Message authored by the HIDDEN_SENDER (real_sender_id 3) inside
+            // TALKER's *visible* session. Used by the search-visibility tests:
+            // the session is not hidden, but the sender is, so search hits
+            // from this message must be filtered unless show_hidden=1.
+            conn.execute(
+                &format!(
+                    "INSERT INTO [{table}] VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    table = MSG_TABLE
+                ),
+                params![
+                    600_i64,
+                    3101_i64,
+                    1_i64,
+                    3_i64, // HIDDEN_SENDER
+                    1_709_251_300_i64,
+                    b"hiddenplans briefing" as &[u8],
+                    None::<Vec<u8>>,
+                    0_i32,
+                    None::<i32>,
+                ],
+            )
+            .expect("insert hidden-sender message");
 
             let video_info_msg_video = encode_packed_info_for_test(None, Some("vid002"));
             conn.execute(

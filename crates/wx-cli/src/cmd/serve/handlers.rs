@@ -686,6 +686,10 @@ pub struct SearchParams {
     limit: usize,
     #[serde(default)]
     offset: usize,
+    /// `1`/`true` to include results from hidden contacts (parity with the
+    /// sessions/contacts endpoints). Default: hidden persons are excluded.
+    #[serde(default)]
+    show_hidden: Option<String>,
 }
 
 pub async fn handler_search(
@@ -700,12 +704,14 @@ pub async fn handler_search(
     let self_wxid = state.self_wxid.clone();
     let limit = wx_db::effective_limit(params.limit);
     let offset = params.offset;
+    let show_hidden = matches!(params.show_hidden.as_deref(), Some("1") | Some("true"));
 
     // Phase 1: Try native FTS using the independent connection (NO main DB lock).
     let fts_conn = state.fts_conn.clone();
     let q_clone = q.clone();
     let resolver_clone = Arc::clone(&resolver);
     let self_wxid_clone = self_wxid.clone();
+    let visibility_clone = Arc::clone(&state.visibility);
     let state_arc = Arc::clone(&state);
 
     let native_result: Option<Result<JsonEnvelope<_>, ServeError>> = if let Some(fts_mutex) =
@@ -739,13 +745,22 @@ pub async fn handler_search(
                 Some(&name2id),
             ) {
                 Ok(result) => {
-                    let total = result.total_hits;
                     let items: Vec<_> = result
                         .hits
                         .into_iter()
                         .map(|hit| enrich_native_fts_hit(hit, &self_wxid_clone, &resolver_clone))
                         .collect();
+                    // Contact hiding applies to search results too: drop hits
+                    // from/into hidden persons, then rebuild paging on the
+                    // visible slice. (Post-filtering may return fewer than
+                    // `limit` rows; totals reflect the visible set.)
+                    let items = crate::visibility_projection::project_search_hits(
+                        items,
+                        &visibility_clone,
+                        show_hidden,
+                    );
                     let returned = items.len();
+                    let total = items.len();
                     let has_more = offset + returned < total;
                     Ok(JsonEnvelope {
                         items,
@@ -787,6 +802,7 @@ pub async fn handler_search(
 
     // Phase 2: Scan fallback — requires main DB lock.
     let db = Arc::clone(&state.db);
+    let visibility_scan = Arc::clone(&state.visibility);
     let result = tokio::task::spawn_blocking(move || {
         let mut guard = db.lock().map_err(|e| ServeError::Internal(e.to_string()))?;
 
@@ -837,7 +853,7 @@ pub async fn handler_search(
             }
         };
 
-        let (hits, total_hits, scan_scanned, scan_skipped, shard_warnings): (
+        let (hits, _total_hits, scan_scanned, scan_skipped, shard_warnings): (
             Vec<_>,
             usize,
             usize,
@@ -921,16 +937,21 @@ pub async fn handler_search(
             }
         };
 
-        let returned = hits.len();
-        let has_more = offset + returned < total_hits;
+        // Contact hiding applies to search results: drop hits from/into
+        // hidden persons, then rebuild paging on the visible slice.
+        let visible_hits =
+            crate::visibility_projection::project_search_hits(hits, &visibility_scan, show_hidden);
+        let returned = visible_hits.len();
+        let visible_total = visible_hits.len();
+        let has_more = offset + returned < visible_total;
         let envelope = JsonEnvelope {
-            items: hits,
+            items: visible_hits,
             paging: crate::output::PagingMeta {
                 limit,
                 offset,
                 returned,
                 has_more,
-                total: total_hits,
+                total: visible_total,
             },
             stats: crate::output::StatsMeta {
                 scanned: scan_scanned,

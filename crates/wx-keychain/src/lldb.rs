@@ -17,23 +17,20 @@ use wx_decrypt::validate_key;
 /// `create_new` guarantees the file is fresh: a stale leftover is replaced by
 /// the caller after removal, and a planted symlink/hardlink is never followed
 /// (`O_EXCL` semantics — the link name is removed, not dereferenced). On Unix
-/// the file is created 0600 and re-tightened after open (covers umask edge
-/// cases); non-Unix targets get the same atomic-write behaviour without
-/// permission bits.
+/// the file is created 0600 and opened with O_NOFOLLOW; non-Unix targets get
+/// the same atomic-write behaviour without permission bits.
 fn open_write_0600(path: &std::path::Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let file = std::fs::OpenOptions::new()
+        use std::os::unix::fs::OpenOptionsExt;
+        std::fs::OpenOptions::new()
             .create_new(true)
             .write(true)
             .mode(0o600)
             // Refuse to follow a symlink planted at the capture path (TOCTOU
             // defense on shared temp dirs).
             .custom_flags(libc::O_NOFOLLOW)
-            .open(path)?;
-        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
-        Ok(file)
+            .open(path)
     }
     #[cfg(not(unix))]
     {
@@ -42,6 +39,14 @@ fn open_write_0600(path: &std::path::Path) -> std::io::Result<std::fs::File> {
             .write(true)
             .open(path)
     }
+}
+
+/// Whether the redacted LLDB transcript should be persisted.
+///
+/// Only the exact value `1` enables it: `WX_CLI_DEBUG_LLDB=0` (or any other
+/// value) must not accidentally persist key-derived material.
+fn debug_transcript_enabled() -> bool {
+    std::env::var("WX_CLI_DEBUG_LLDB").map_or(false, |v| v == "1")
 }
 
 /// Persist the redacted LLDB transcript (WX_CLI_DEBUG_LLDB=1 only).
@@ -287,7 +292,7 @@ pub async fn capture_key(
     // key — and its salt. By default we do NOT persist it at all. When
     // WX_CLI_DEBUG_LLDB=1 is set, a redacted copy (password/salt hex masked)
     // is written with mode 0600 for debugging; the raw values never hit disk.
-    if std::env::var_os("WX_CLI_DEBUG_LLDB").is_some() {
+    if debug_transcript_enabled() {
         let redacted = redact_sensitive_lines(&output_lines);
         if let Some(parent) = output_path.parent() {
             if let Err(err) = wx_paths::AppPaths::ensure_dir(parent) {
@@ -422,6 +427,19 @@ mod tests {
 
     fn lines(input: &[&str]) -> Vec<String> {
         input.iter().map(|s| s.to_string()).collect()
+    }
+
+    #[test]
+    fn debug_transcript_requires_exact_value_1() {
+        use super::debug_transcript_enabled;
+        std::env::set_var("WX_CLI_DEBUG_LLDB", "1");
+        assert!(debug_transcript_enabled());
+        for off in ["0", "true", "yes", ""] {
+            std::env::set_var("WX_CLI_DEBUG_LLDB", off);
+            assert!(!debug_transcript_enabled(), "{off:?} must not enable it");
+        }
+        std::env::remove_var("WX_CLI_DEBUG_LLDB");
+        assert!(!debug_transcript_enabled());
     }
 
     #[test]

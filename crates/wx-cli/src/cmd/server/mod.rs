@@ -18,6 +18,17 @@ pub async fn cmd_server(action: ServerAction) -> Result<(), Box<dyn std::error::
 }
 
 async fn cmd_server_worker(args: ServerWorkerArgs) -> Result<(), Box<dyn std::error::Error>> {
+    // The manager passes secrets through the environment so they never appear
+    // in argv (visible to any local user via `ps`). CLI flags are kept as a
+    // fallback for direct `_worker` invocations (e.g. integration tests).
+    let mut args = args;
+    if args.key.is_none() {
+        args.key = std::env::var("WX_CLI_WORKER_KEY").ok();
+    }
+    if args.token.is_none() {
+        args.token = std::env::var("WX_CLI_WORKER_TOKEN").ok();
+    }
+
     let ap = match args.runtime_root.clone() {
         Some(root) => wx_paths::AppPaths::with_runtime_root(root)?,
         None => wx_paths::AppPaths::new()?,

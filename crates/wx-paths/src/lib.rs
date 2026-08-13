@@ -149,6 +149,14 @@ impl AppPaths {
         self.server_state_dir().join("config.json")
     }
 
+    /// Server secrets file: `<server_state_dir>/secrets.json`
+    ///
+    /// Holds the raw key/token material that is deliberately NOT written into
+    /// `config.json`. Created with mode 0600 by the server manager.
+    pub fn server_secrets_file(&self) -> PathBuf {
+        self.server_state_dir().join("secrets.json")
+    }
+
     /// Server state file: `<server_state_dir>/state.json`
     pub fn server_state_file(&self) -> PathBuf {
         self.server_state_dir().join("state.json")

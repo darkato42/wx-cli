@@ -8,7 +8,7 @@ use serde::de::DeserializeOwned;
 use serde::Serialize;
 use wx_paths::AppPaths;
 
-use super::types::{ServerHealthPayload, ServerLaunchConfig, ServerRuntimeState};
+use super::types::{ServerHealthPayload, ServerLaunchConfig, ServerRuntimeState, ServerSecrets};
 
 pub struct ManagementLockGuard {
     lock_file: PathBuf,
@@ -84,17 +84,67 @@ pub fn save_runtime_state(
     save_json(&ap.server_state_file(), state)
 }
 
+/// Load the persisted launch config, re-attaching any secrets from the
+/// separate 0600 secrets file. A missing secrets file (e.g. written by an
+/// older version that stored secrets inline) yields a config with no secrets.
 pub fn load_launch_config(
     ap: &AppPaths,
 ) -> Result<Option<ServerLaunchConfig>, Box<dyn std::error::Error>> {
-    load_json(&ap.server_config_file())
+    let Some(mut config) = load_json::<ServerLaunchConfig>(&ap.server_config_file())? else {
+        return Ok(None);
+    };
+    if let Some(secrets) = load_json::<ServerSecrets>(&ap.server_secrets_file())? {
+        config.key = secrets.key;
+        config.token = secrets.token;
+    }
+    Ok(Some(config))
 }
 
+/// Persist the launch config. `key` and `token` are serialization-skipped on
+/// `ServerLaunchConfig`, so `config.json` holds no secrets; they are written to
+/// a sibling `secrets.json` created with mode 0600 (owner read/write only).
 pub fn save_launch_config(
     ap: &AppPaths,
     config: &ServerLaunchConfig,
 ) -> Result<(), Box<dyn std::error::Error>> {
-    save_json(&ap.server_config_file(), config)
+    save_json(&ap.server_config_file(), config)?;
+    save_secrets_file(
+        ap,
+        &ServerSecrets {
+            key: config.key.clone(),
+            token: config.token.clone(),
+        },
+    )
+}
+
+/// Write the secrets file with restrictive permissions. The temp file is
+/// created 0600 *before* writing so there is no 0644 window, and the final
+/// file is chmodded 0600 after rename as belt-and-braces.
+fn save_secrets_file(
+    ap: &AppPaths,
+    secrets: &ServerSecrets,
+) -> Result<(), Box<dyn std::error::Error>> {
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+
+    let path = ap.server_secrets_file();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+
+    let temp = path.with_extension("json.tmp");
+    {
+        let mut file = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&temp)?;
+        file.write_all(&serde_json::to_vec_pretty(secrets)?)?;
+        file.flush()?;
+    }
+    fs::rename(&temp, &path)?;
+    fs::set_permissions(&path, fs::Permissions::from_mode(0o600))?;
+    Ok(())
 }
 
 pub fn remove_runtime_state(ap: &AppPaths) -> Result<(), Box<dyn std::error::Error>> {

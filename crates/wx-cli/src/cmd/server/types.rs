@@ -185,6 +185,10 @@ pub enum ServerAction {
 
 #[derive(Clone, Debug, Serialize, Deserialize, PartialEq, Eq)]
 pub struct ServerLaunchConfig {
+    /// Raw SQLCipher key (32-byte hex). NEVER serialized to disk — kept only in
+    /// memory and passed to the worker via an environment variable. Persisted
+    /// separately in the 0600 secrets file so `config.json` carries no secrets.
+    #[serde(skip)]
     pub key: Option<String>,
     pub data_dir: Option<PathBuf>,
     pub account: Option<String>,
@@ -193,6 +197,8 @@ pub struct ServerLaunchConfig {
     pub poll_ms: u64,
     pub host: String,
     pub port: u16,
+    /// Bearer token. NEVER serialized to disk — same handling as `key`.
+    #[serde(skip)]
     pub token: Option<String>,
     #[serde(default)]
     pub no_auth: bool,
@@ -200,6 +206,19 @@ pub struct ServerLaunchConfig {
     pub cors_origins: Vec<String>,
     #[serde(default)]
     pub allowed_hosts: Vec<String>,
+}
+
+/// The secret half of a `ServerLaunchConfig`.
+///
+/// Written to `<server_state_dir>/secrets.json` with mode 0600. Kept separate
+/// from `config.json` so the config file (which is read by status/tooling and
+/// may end up in logs or dumps) contains no key material.
+#[derive(Clone, Debug, Default, Serialize, Deserialize, PartialEq, Eq)]
+pub struct ServerSecrets {
+    #[serde(default)]
+    pub key: Option<String>,
+    #[serde(default)]
+    pub token: Option<String>,
 }
 
 impl From<ServerRunArgs> for ServerLaunchConfig {

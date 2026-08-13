@@ -507,6 +507,7 @@ mod tests {
     /// Serializes env-var mutation across parallel tests.
     static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
+    #[cfg(unix)]
     #[test]
     fn symlinked_temp_dir_components_are_rejected() {
         use super::ensure_not_symlink;

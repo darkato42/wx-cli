@@ -222,11 +222,14 @@ pub async fn capture_key(
             }
         }
     }
+    // Guard lives at function scope for the WHOLE capture: it must be alive
+    // when LLDB runs `command script import` (the script is consumed during
+    // the session) and only remove the script on function exit/cancellation.
+    // Placed before the write so an early failure (disk full, spawn error)
+    // still cleans up.
+    let _script_cleanup = ScriptCleanup(&script_path);
     {
         use std::io::Write;
-        // Guard precedes the write so an early failure (disk full, spawn
-        // error later, cancellation) still removes the script on exit.
-        let _script_cleanup = ScriptCleanup(&script_path);
         let mut file = match open_write_0600(&script_path) {
             Ok(file) => file,
             Err(err) if is_stale_name(&err) => {

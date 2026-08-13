@@ -69,16 +69,26 @@ pub async fn capture_key(
     let script_path = wx_paths::AppPaths::lldb_script_file();
     if let Some(parent) = script_path.parent() {
         wx_paths::AppPaths::ensure_dir(parent)?;
+        // The lldb dir may sit in a shared temp location; make it owner-only
+        // so other local users cannot plant symlinks into the capture paths.
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
     }
     {
         use std::io::Write;
-        use std::os::unix::fs::OpenOptionsExt;
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
         let mut file = std::fs::OpenOptions::new()
             .create(true)
             .truncate(true)
             .write(true)
             .mode(0o600)
+            // Refuse to follow a symlink planted at the script path (TOCTOU
+            // defense on shared temp dirs).
+            .custom_flags(libc::O_NOFOLLOW)
             .open(&script_path)?;
+        // `.mode(0o600)` only applies at creation: a stale script left by a
+        // crashed run keeps its old mode. Tighten right after open.
+        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o600))?;
         file.write_all(CAPTURE_KEY_SCRIPT.as_bytes())?;
     }
 
@@ -224,14 +234,17 @@ pub async fn capture_key(
         }
         {
             use std::io::Write;
-            use std::os::unix::fs::OpenOptionsExt;
+            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
             if let Ok(mut file) = std::fs::OpenOptions::new()
                 .create(true)
                 .truncate(true)
                 .write(true)
                 .mode(0o600)
+                .custom_flags(libc::O_NOFOLLOW)
                 .open(&output_path)
             {
+                let _ =
+                    std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o600));
                 let _ = file.write_all(redacted.join("\n").as_bytes());
             }
         }
@@ -241,11 +254,21 @@ pub async fn capture_key(
         );
     } else if output_path.exists() {
         // Clean up transcripts left by older versions.
-        let _ = std::fs::remove_file(&output_path);
+        if let Err(err) = std::fs::remove_file(&output_path) {
+            eprintln!(
+                "WARNING: could not remove leftover LLDB transcript {}: {err}",
+                output_path.display()
+            );
+        }
     }
 
     // Remove the capture script now that the session is over.
-    let _ = std::fs::remove_file(&script_path);
+    if let Err(err) = std::fs::remove_file(&script_path) {
+        eprintln!(
+            "WARNING: could not remove LLDB capture script {}: {err}",
+            script_path.display()
+        );
+    }
 
     match result {
         Ok(inner) => inner,
@@ -289,12 +312,42 @@ pub(crate) fn redact_sensitive_lines(lines: &[String]) -> Vec<String> {
         Some(format!("{indent}{keyword}: <redacted>"))
     }
 
+    /// Defense in depth: if the LLDB output format drifts from the
+    /// "Keyword: <hex>" shape (extra whitespace, changed case, wrapped
+    /// values, stderr interleaving), a bare 32/64-hex token must still not
+    /// survive in the retained transcript. Both the PBKDF2 password (64 hex)
+    /// and salt (32 hex) are masked wherever they appear as standalone runs.
+    /// Shorter hex runs (e.g. memory addresses) are left intact.
+    fn mask_hex_tokens(line: &str) -> String {
+        let mut out = String::with_capacity(line.len());
+        let mut hex_run = String::new();
+        for ch in line.chars() {
+            if ch.is_ascii_hexdigit() {
+                hex_run.push(ch);
+            } else {
+                if hex_run.len() == 32 || hex_run.len() == 64 {
+                    out.push_str("<redacted>");
+                } else {
+                    out.push_str(&hex_run);
+                }
+                hex_run.clear();
+                out.push(ch);
+            }
+        }
+        if hex_run.len() == 32 || hex_run.len() == 64 {
+            out.push_str("<redacted>");
+        } else {
+            out.push_str(&hex_run);
+        }
+        out
+    }
+
     lines
         .iter()
         .map(|line| {
             mask(line, "Password")
                 .or_else(|| mask(line, "Salt"))
-                .unwrap_or_else(|| line.clone())
+                .unwrap_or_else(|| mask_hex_tokens(line))
         })
         .collect()
 }
@@ -327,6 +380,27 @@ mod tests {
         );
         assert!(!joined.contains("4f3daabb"));
         assert!(!joined.contains("8c01fe7a"));
+    }
+
+    #[test]
+    fn drifted_format_hex_tokens_are_still_masked() {
+        // Format drift (wrapped value, no keyword, case change) must not let
+        // a 32/64-hex secret survive the redactor.
+        let password = "4f3daabbccddeeff00112233445566778899aabbccddeeff0011223344556677";
+        let salt = "8c01fe7a1234567890abcdef12345678";
+        let input = lines(&[
+            &format!("Password = {password}"),       // keyword shape changed
+            &format!("    salt: {salt}"),            // lowercase keyword
+            &format!("interleaved {password} here"), // bare token mid-line
+            "frame #0: 0x0000000100003f50",          // 16-hex address: must NOT mask
+            "done",
+        ]);
+        let out = redact_sensitive_lines(&input);
+        let joined = out.join("\n");
+        assert!(!joined.contains(&password[..16]), "{joined}");
+        assert!(!joined.contains(&salt[..16]), "{joined}");
+        assert!(joined.contains("0x0000000100003f50"), "{joined}");
+        assert!(joined.contains("done"), "{joined}");
     }
 
     #[test]

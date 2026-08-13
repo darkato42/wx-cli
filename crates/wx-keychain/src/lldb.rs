@@ -12,6 +12,59 @@ use crate::script::CAPTURE_KEY_SCRIPT;
 use wx_decrypt::params::MACOS_4_1_7_31;
 use wx_decrypt::validate_key;
 
+/// Open a capture file for writing, refusing to write into an existing path.
+///
+/// `create_new` guarantees the file is fresh: a stale leftover is replaced by
+/// the caller after removal, and a planted symlink/hardlink is never followed
+/// (`O_EXCL` semantics — the link name is removed, not dereferenced). On Unix
+/// the file is created 0600 and re-tightened after open (covers umask edge
+/// cases); non-Unix targets get the same atomic-write behaviour without
+/// permission bits.
+fn open_write_0600(path: &std::path::Path) -> std::io::Result<std::fs::File> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
+        let file = std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .mode(0o600)
+            // Refuse to follow a symlink planted at the capture path (TOCTOU
+            // defense on shared temp dirs).
+            .custom_flags(libc::O_NOFOLLOW)
+            .open(path)?;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(0o600))?;
+        Ok(file)
+    }
+    #[cfg(not(unix))]
+    {
+        std::fs::OpenOptions::new()
+            .create_new(true)
+            .write(true)
+            .open(path)
+    }
+}
+
+/// Persist the redacted LLDB transcript (WX_CLI_DEBUG_LLDB=1 only).
+///
+/// Returns an error instead of failing silently so the caller can report that
+/// no transcript was actually produced.
+fn write_redacted_transcript(
+    output_path: &std::path::Path,
+    redacted: &[String],
+) -> std::io::Result<()> {
+    use std::io::Write;
+    let mut file = match open_write_0600(output_path) {
+        Ok(file) => file,
+        Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+            // Stale transcript from an earlier debug run: remove and retry.
+            std::fs::remove_file(output_path)?;
+            open_write_0600(output_path)?
+        }
+        Err(err) => return Err(err),
+    };
+    file.write_all(redacted.join("\n").as_bytes())
+}
+
 /// Result of a successful key capture.
 #[derive(Debug)]
 pub struct CaptureResult {
@@ -71,24 +124,31 @@ pub async fn capture_key(
         wx_paths::AppPaths::ensure_dir(parent)?;
         // The lldb dir may sit in a shared temp location; make it owner-only
         // so other local users cannot plant symlinks into the capture paths.
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) =
+                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+            {
+                eprintln!(
+                    "WARNING: could not tighten {} to 0700: {err}",
+                    parent.display()
+                );
+            }
+        }
     }
     {
         use std::io::Write;
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-        let mut file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .write(true)
-            .mode(0o600)
-            // Refuse to follow a symlink planted at the script path (TOCTOU
-            // defense on shared temp dirs).
-            .custom_flags(libc::O_NOFOLLOW)
-            .open(&script_path)?;
-        // `.mode(0o600)` only applies at creation: a stale script left by a
-        // crashed run keeps its old mode. Tighten right after open.
-        std::fs::set_permissions(&script_path, std::fs::Permissions::from_mode(0o600))?;
+        let mut file = match open_write_0600(&script_path) {
+            Ok(file) => file,
+            Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                // Stale script from a crashed run (or a planted link):
+                // remove the name — never follow it — and retry once.
+                std::fs::remove_file(&script_path)?;
+                open_write_0600(&script_path)?
+            }
+            Err(err) => return Err(err.into()),
+        };
         file.write_all(CAPTURE_KEY_SCRIPT.as_bytes())?;
     }
 
@@ -230,28 +290,32 @@ pub async fn capture_key(
     if std::env::var_os("WX_CLI_DEBUG_LLDB").is_some() {
         let redacted = redact_sensitive_lines(&output_lines);
         if let Some(parent) = output_path.parent() {
-            let _ = wx_paths::AppPaths::ensure_dir(parent);
-        }
-        {
-            use std::io::Write;
-            use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-            if let Ok(mut file) = std::fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o600)
-                .custom_flags(libc::O_NOFOLLOW)
-                .open(&output_path)
+            if let Err(err) = wx_paths::AppPaths::ensure_dir(parent) {
+                eprintln!("WARNING: could not create {}: {err}", parent.display());
+            }
+            #[cfg(unix)]
             {
-                let _ =
-                    std::fs::set_permissions(&output_path, std::fs::Permissions::from_mode(0o600));
-                let _ = file.write_all(redacted.join("\n").as_bytes());
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) =
+                    std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
+                {
+                    eprintln!(
+                        "WARNING: could not tighten {} to 0700: {err}",
+                        parent.display()
+                    );
+                }
             }
         }
-        eprintln!(
-            "WX_CLI_DEBUG_LLDB set: redacted LLDB transcript written to {}",
-            output_path.display()
-        );
+        match write_redacted_transcript(&output_path, &redacted) {
+            Ok(()) => eprintln!(
+                "WX_CLI_DEBUG_LLDB set: redacted LLDB transcript written to {}",
+                output_path.display()
+            ),
+            Err(err) => eprintln!(
+                "WARNING: WX_CLI_DEBUG_LLDB set but could not write redacted transcript to {}: {err}",
+                output_path.display()
+            ),
+        }
     } else if output_path.exists() {
         // Clean up transcripts left by older versions.
         if let Err(err) = std::fs::remove_file(&output_path) {
@@ -374,10 +438,7 @@ mod tests {
         assert_eq!(out[2], "    Salt: <redacted>");
         assert_eq!(out[3], "done");
         // The raw hex values must not survive anywhere.
-        let joined = out.join(
-            "
-",
-        );
+        let joined = out.join("\n");
         assert!(!joined.contains("4f3daabb"));
         assert!(!joined.contains("8c01fe7a"));
     }

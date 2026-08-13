@@ -507,12 +507,33 @@ pub(crate) fn redact_sensitive_lines(lines: &[String]) -> Vec<String> {
         out
     }
 
+    /// True when `line` is nothing but hex digits and whitespace — the shape
+    /// of a wrapped continuation of a Password:/Salt: value that doesn't
+    /// happen to land on a clean 32/64-char boundary (e.g. wrapped as
+    /// 40+24 hex chars across two lines).
+    fn is_hex_only_continuation(line: &str) -> bool {
+        let trimmed = line.trim();
+        !trimmed.is_empty() && trimmed.chars().all(|c| c.is_ascii_hexdigit())
+    }
+
+    // Track whether we just redacted a Password:/Salt: line so a following
+    // hex-only continuation line (wrapped value) is masked outright, even
+    // when its length isn't exactly 32 or 64 (defense-in-depth for format
+    // drift beyond what mask_hex_tokens' fixed-length check covers).
+    let mut expect_continuation = false;
     lines
         .iter()
         .map(|line| {
-            mask(line, "Password")
-                .or_else(|| mask(line, "Salt"))
-                .unwrap_or_else(|| mask_hex_tokens(line))
+            if let Some(redacted) = mask(line, "Password").or_else(|| mask(line, "Salt")) {
+                expect_continuation = true;
+                return redacted;
+            }
+            if expect_continuation && is_hex_only_continuation(line) {
+                let indent = &line[..line.len() - line.trim_start().len()];
+                return format!("{indent}<redacted>");
+            }
+            expect_continuation = false;
+            mask_hex_tokens(line)
         })
         .collect()
 }
@@ -583,6 +604,26 @@ mod tests {
         let joined = out.join("\n");
         assert!(!joined.contains("4f3daabb"));
         assert!(!joined.contains("8c01fe7a"));
+    }
+
+    #[test]
+    fn wrapped_password_continuation_is_masked() {
+        // Simulates a value wrapped mid-hex-run across two lines by an lldb
+        // format change: neither half is exactly 32 or 64 hex chars, so
+        // mask_hex_tokens alone would miss it, but it directly follows a
+        // Password: line so the continuation guard catches it.
+        let input = lines(&[
+            "    Password: 4f3daabbccddeeff0011223344556677889",
+            "9aabbccddeeff0011223344556677",
+            "done",
+        ]);
+        let out = redact_sensitive_lines(&input);
+        assert_eq!(out[0], "    Password: <redacted>");
+        assert_eq!(out[1], "<redacted>");
+        assert_eq!(out[2], "done");
+        let joined = out.join("\n");
+        assert!(!joined.contains("4f3daabb"));
+        assert!(!joined.contains("9aabbccd"));
     }
 
     #[test]

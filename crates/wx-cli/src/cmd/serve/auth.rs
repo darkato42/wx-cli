@@ -10,21 +10,23 @@ use subtle::ConstantTimeEq;
 
 use super::state::AppState;
 
-/// Constant-time comparison of a presented bearer token against the expected
-/// value.
+/// Constant-time comparison of a presented bearer token against a
+/// precomputed digest of the expected value.
 ///
-/// Both sides are hashed with SHA-256 before comparing, so:
+/// Only the *presented* side is hashed, per request; the expected side was
+/// hashed once at startup and is stored in `AppState` as a fixed-size digest.
+/// This means:
 /// - the comparison takes the same time regardless of *where* the first
 ///   difference occurs (no early-exit on a mismatching byte), and
-/// - the *length* of the expected token is not revealed (a length mismatch
-///   would otherwise return immediately, leaking information via timing).
+/// - the *length* of the expected token cannot leak via timing: it never
+///   participates in per-request work, so neither its hash time nor a length
+///   mismatch can be observed. (The presented token's length is attacker-known
+///   anyway, so its own hash time leaks nothing.)
 ///
-/// The digest values are then compared with `subtle::ConstantTimeEq`, which
-/// compiles to a fixed sequence of XOR/OR operations with no data-dependent
-/// branches.
-fn tokens_equal(presented: &str, expected: &str) -> bool {
-    let presented_digest = Sha256::digest(presented.as_bytes());
-    let expected_digest = Sha256::digest(expected.as_bytes());
+/// The digests are compared with `subtle::ConstantTimeEq`, which compiles to a
+/// fixed sequence of XOR/OR operations with no data-dependent branches.
+fn tokens_equal(presented: &str, expected_digest: [u8; 32]) -> bool {
+    let presented_digest: [u8; 32] = Sha256::digest(presented.as_bytes()).into();
     bool::from(presented_digest.ct_eq(&expected_digest))
 }
 
@@ -114,7 +116,7 @@ pub async fn bearer_auth(
     request: Request<axum::body::Body>,
     next: Next,
 ) -> Response {
-    let Some(expected) = &state.auth_token else {
+    let Some(expected_digest) = state.auth_token_digest else {
         return next.run(request).await;
     };
 
@@ -123,7 +125,7 @@ pub async fn bearer_auth(
         .get("authorization")
         .and_then(|v| v.to_str().ok())
         .and_then(|v| v.strip_prefix("Bearer "))
-        .map(|token| tokens_equal(token, expected))
+        .map(|token| tokens_equal(token, expected_digest))
         .unwrap_or(false);
 
     if authorized {
@@ -140,34 +142,50 @@ pub async fn bearer_auth(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use sha2::{Digest, Sha256};
+
+    fn digest(secret: &str) -> [u8; 32] {
+        Sha256::digest(secret.as_bytes()).into()
+    }
 
     #[test]
     fn equal_tokens_match() {
-        assert!(tokens_equal("secret-token", "secret-token"));
+        assert!(tokens_equal("secret-token", digest("secret-token")));
         // Unicode content hashes deterministically too.
-        assert!(tokens_equal("你好-世界", "你好-世界"));
+        assert!(tokens_equal("你好-世界", digest("你好-世界")));
     }
 
     #[test]
     fn different_tokens_do_not_match() {
-        assert!(!tokens_equal("secret-token", "secret-tokem"));
-        assert!(!tokens_equal("secret-token", "Secret-token"));
-        assert!(!tokens_equal("", "secret-token"));
-        assert!(!tokens_equal("secret-token", ""));
+        assert!(!tokens_equal("secret-token", digest("secret-tokem")));
+        assert!(!tokens_equal("secret-token", digest("Secret-token")));
+        assert!(!tokens_equal("", digest("secret-token")));
+        assert!(!tokens_equal("secret-token", digest("")));
     }
 
     #[test]
     fn tokens_of_different_length_do_not_match() {
-        // Length mismatch must still return false (constant-time hashing makes
-        // the comparison itself not reveal the length, but equality is false).
-        assert!(!tokens_equal("short", "a-much-longer-token"));
-        assert!(!tokens_equal("a-much-longer-token", "short"));
+        // Length mismatch must still return false; equality is false even
+        // though only fixed-size digests are compared.
+        assert!(!tokens_equal("short", digest("a-much-longer-token")));
+        assert!(!tokens_equal("a-much-longer-token", digest("short")));
     }
 
     #[test]
     fn empty_tokens_match_only_each_other() {
-        assert!(tokens_equal("", ""));
-        assert!(!tokens_equal("", "x"));
+        assert!(tokens_equal("", digest("")));
+        assert!(!tokens_equal("", digest("x")));
+    }
+
+    #[test]
+    fn comparison_does_not_depend_on_expected_value_work() {
+        // The expected side is pre-hashed once: tokens_equal must reject even
+        // when only the digest is available, and the digest is not derivable
+        // from the function's behavior beyond the compare itself.
+        let secret = "super-secret-token";
+        let d = digest(secret);
+        assert!(tokens_equal(secret, d));
+        assert!(!tokens_equal("wrong", d));
     }
 
     #[test]

@@ -44,7 +44,13 @@ pub struct AppState {
     /// Broadcast channel for SSE events.
     pub broadcast_tx: broadcast::Sender<Arc<SseEvent>>,
     /// Optional Bearer token for auth.
-    pub auth_token: Option<String>,
+    /// Precomputed SHA-256 digest of the bearer token, or None with --no-auth.
+    ///
+    /// The digest — not the raw token — is stored so the per-request auth check
+    /// never touches expected-secret material: no re-hashing of the expected
+    /// value (its length cannot leak via hash time), and the comparison is a
+    /// fixed-size constant-time digest compare.
+    pub auth_token_digest: Option<[u8; 32]>,
     /// Hostnames accepted in the `Host` header beyond loopback literals.
     /// Populated from `--allow-host`; empty means loopback-only (DNS-rebinding safe).
     pub allowed_hosts: Vec<String>,

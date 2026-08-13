@@ -49,6 +49,24 @@ fn debug_transcript_enabled() -> bool {
     std::env::var("WX_CLI_DEBUG_LLDB").map_or(false, |v| v == "1")
 }
 
+/// RAII guard: removes the capture script on every exit path, so an early
+/// error (e.g. failing to spawn lldb, missing stdout/stderr pipes) cannot
+/// leave the 0600 script behind. Also fires if the future is cancelled.
+struct ScriptCleanup<'a>(&'a std::path::Path);
+
+impl Drop for ScriptCleanup<'_> {
+    fn drop(&mut self) {
+        match std::fs::remove_file(self.0) {
+            Ok(()) => {}
+            Err(err) if err.kind() == std::io::ErrorKind::NotFound => {}
+            Err(err) => eprintln!(
+                "WARNING: could not remove LLDB capture script {}: {err}",
+                self.0.display()
+            ),
+        }
+    }
+}
+
 /// Persist the redacted LLDB transcript (WX_CLI_DEBUG_LLDB=1 only).
 ///
 /// Returns an error instead of failing silently so the caller can report that
@@ -132,14 +150,17 @@ pub async fn capture_key(
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            if let Err(err) =
-                std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700))
-            {
-                eprintln!(
-                    "WARNING: could not tighten {} to 0700: {err}",
-                    parent.display()
-                );
-            }
+            // Fail closed: the capture writes key material into this dir, so
+            // if it cannot be secured against other local users we must not
+            // proceed (the "no planted symlinks" guarantee would not hold).
+            std::fs::set_permissions(parent, std::fs::Permissions::from_mode(0o700)).map_err(
+                |err| {
+                    KeychainError::Other(format!(
+                        "could not secure LLDB capture dir {} to 0700: {err}",
+                        parent.display()
+                    ))
+                },
+            )?;
         }
     }
     {
@@ -156,6 +177,8 @@ pub async fn capture_key(
         };
         file.write_all(CAPTURE_KEY_SCRIPT.as_bytes())?;
     }
+    // Removes the script on all exit paths (success, early error, cancel).
+    let _script_cleanup = ScriptCleanup(&script_path);
 
     // Prepare LLDB output file.
     let output_path = wx_paths::AppPaths::lldb_output_file();
@@ -331,13 +354,7 @@ pub async fn capture_key(
         }
     }
 
-    // Remove the capture script now that the session is over.
-    if let Err(err) = std::fs::remove_file(&script_path) {
-        eprintln!(
-            "WARNING: could not remove LLDB capture script {}: {err}",
-            script_path.display()
-        );
-    }
+    // (The capture script is removed by ScriptCleanup on scope exit.)
 
     match result {
         Ok(inner) => inner,
@@ -429,17 +446,26 @@ mod tests {
         input.iter().map(|s| s.to_string()).collect()
     }
 
+    /// Serializes env-var mutation across parallel tests.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     #[test]
     fn debug_transcript_requires_exact_value_1() {
         use super::debug_transcript_enabled;
+        let _guard = ENV_LOCK.lock().unwrap();
+        // Restore the previous value (or absence) so other tests are not
+        // affected by this one's mutation of the process-wide environment.
+        let previous = std::env::var("WX_CLI_DEBUG_LLDB").ok();
         std::env::set_var("WX_CLI_DEBUG_LLDB", "1");
         assert!(debug_transcript_enabled());
         for off in ["0", "true", "yes", ""] {
             std::env::set_var("WX_CLI_DEBUG_LLDB", off);
             assert!(!debug_transcript_enabled(), "{off:?} must not enable it");
         }
-        std::env::remove_var("WX_CLI_DEBUG_LLDB");
-        assert!(!debug_transcript_enabled());
+        match previous {
+            Some(value) => std::env::set_var("WX_CLI_DEBUG_LLDB", value),
+            None => std::env::remove_var("WX_CLI_DEBUG_LLDB"),
+        }
     }
 
     #[test]

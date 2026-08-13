@@ -59,6 +59,7 @@ pub struct KeyStore {
 /// Files written by this crate are 0600; files created by older versions (or
 /// by a umask override) may be looser. The warning is advisory — the file is
 /// still read, since refusing would lock the user out of their own keys.
+#[cfg(unix)]
 fn warn_if_world_readable(path: &Path) {
     use std::os::unix::fs::PermissionsExt;
 
@@ -76,6 +77,10 @@ fn warn_if_world_readable(path: &Path) {
         );
     }
 }
+
+/// Non-Unix fallback: no permission-bit model to warn about.
+#[cfg(not(unix))]
+fn warn_if_world_readable(_path: &Path) {}
 
 impl KeyStore {
     /// Default path: `<config_dir>/keys.toml`
@@ -110,26 +115,55 @@ impl KeyStore {
         self.save(&path)
     }
 
+    /// Open (or recreate) the temp file for an atomic key write.
+    ///
+    /// Uses `create_new` so an existing path is NEVER written into: a stale
+    /// temp left by a crashed run is removed and recreated (fresh inode), and
+    /// a planted symlink/hardlink is refused outright (`O_EXCL` semantics) —
+    /// the link is removed, never followed. On Unix the file is created 0600.
+    fn open_tmp_write_only(tmp_path: &Path) -> std::io::Result<fs::File> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::OpenOptionsExt;
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .mode(0o600)
+                .open(tmp_path)
+        }
+        #[cfg(not(unix))]
+        {
+            fs::OpenOptions::new()
+                .create_new(true)
+                .write(true)
+                .open(tmp_path)
+        }
+    }
+
     /// Save to a specific path, creating parent directories as needed.
     ///
     /// Uses atomic write (write to `.tmp` sibling, then `rename`) to prevent
     /// partial TOML files on crash.
     ///
-    /// Security: this file holds raw decryption keys, so it is created with
-    /// mode 0600 (owner read/write only) and the parent directory is tightened
-    /// to 0700. The temp file is opened 0600 *before* any bytes are written,
-    /// so there is no window where a world-readable copy exists on disk.
+    /// Security: this file holds raw decryption keys, so on Unix it is created
+    /// with mode 0600 (owner read/write only) and the parent directory is
+    /// tightened to 0700. The temp file is opened 0600 *before* any bytes are
+    /// written, so there is no window where a world-readable copy exists on
+    /// disk, and `create_new` guarantees the temp is never a pre-existing
+    /// path (stale temp or planted link).
     pub fn save(&self, path: &Path) -> Result<(), KeychainError> {
-        use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-
         let parent_existed = path.parent().is_none_or(|p| p.exists());
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
-            if let Err(err) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
-                eprintln!(
-                    "WARNING: could not tighten {} to 0700: {err}",
-                    parent.display()
-                );
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                if let Err(err) = fs::set_permissions(parent, fs::Permissions::from_mode(0o700)) {
+                    eprintln!(
+                        "WARNING: could not tighten {} to 0700: {err}",
+                        parent.display()
+                    );
+                }
             }
         }
         let content = toml::to_string_pretty(self)
@@ -137,21 +171,27 @@ impl KeyStore {
 
         let tmp_path = path.with_extension("toml.tmp");
         {
-            let mut file = fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .mode(0o600)
-                .open(&tmp_path)?;
-            // `.mode(0o600)` only applies at creation: a stale temp left by a
-            // crashed earlier run keeps its old (possibly 0644) mode. Tighten
-            // right after open so keys are never written into a permissive
-            // file, even mid-window before the rename.
-            if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600)) {
-                eprintln!(
-                    "WARNING: could not tighten {} to 0600: {err}",
-                    tmp_path.display()
-                );
+            let mut file = match Self::open_tmp_write_only(&tmp_path) {
+                Ok(file) => file,
+                Err(err) if err.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Stale temp from a crashed run (or a planted link):
+                    // remove the name — never follow it — and retry once.
+                    fs::remove_file(&tmp_path)?;
+                    Self::open_tmp_write_only(&tmp_path)?
+                }
+                Err(err) => return Err(err.into()),
+            };
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt;
+                // Belt-and-braces: re-assert 0600 (covers umask edge cases).
+                if let Err(err) = fs::set_permissions(&tmp_path, fs::Permissions::from_mode(0o600))
+                {
+                    eprintln!(
+                        "WARNING: could not tighten {} to 0600: {err}",
+                        tmp_path.display()
+                    );
+                }
             }
             use std::io::Write;
             file.write_all(content.as_bytes())?;
@@ -162,11 +202,15 @@ impl KeyStore {
         })?;
         // Belt-and-braces: the file may pre-exist with looser permissions from
         // an older version; re-assert 0600 after the rename.
-        if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
-            eprintln!(
-                "WARNING: could not tighten {} to 0600: {err}",
-                path.display()
-            );
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Err(err) = fs::set_permissions(path, fs::Permissions::from_mode(0o600)) {
+                eprintln!(
+                    "WARNING: could not tighten {} to 0600: {err}",
+                    path.display()
+                );
+            }
         }
 
         wx_paths::sudo::chown_to_sudo_user(path);
@@ -420,6 +464,7 @@ impl KeyStore {
 mod tests {
     use super::*;
 
+    #[cfg(unix)]
     #[test]
     fn saved_keys_file_is_0600_and_dir_0700() {
         use std::os::unix::fs::PermissionsExt;
@@ -448,6 +493,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_over_existing_permissive_file_tightens_permissions() {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
@@ -473,6 +519,7 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
     #[test]
     fn save_tightens_stale_permissive_temp_file() {
         use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};

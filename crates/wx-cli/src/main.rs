@@ -530,6 +530,13 @@ enum KeyAction {
         /// Timeout in seconds for LLDB capture
         #[arg(long, default_value = "120")]
         timeout: u64,
+        /// Print the extracted key to stdout. Off by default: on success the
+        /// key is saved to the keystore either way (see the final "Key saved
+        /// to ..." message for confirmation); printing it additionally leaks
+        /// it into shell history, logs and terminal scrollback. If the run
+        /// errors out before that final message, the key was not saved.
+        #[arg(long)]
+        print_key: bool,
     },
     /// List stored keys
     List,
@@ -570,7 +577,10 @@ async fn main() {
 
     let result = match cli.command {
         Commands::Key { action } => match action {
-            KeyAction::Extract { timeout: t } => cmd::key::cmd_key_extract(t).await,
+            KeyAction::Extract {
+                timeout: t,
+                print_key,
+            } => cmd::key::cmd_key_extract(t, print_key).await,
             KeyAction::List => cmd::key::cmd_key_list(),
             KeyAction::Set { account, hex_key } => cmd::key::cmd_key_set(&account, &hex_key),
             KeyAction::SetImage { account, image_key } => {

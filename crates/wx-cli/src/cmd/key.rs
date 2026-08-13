@@ -2,7 +2,10 @@ use std::time::Duration;
 
 use crate::util::{lookup_or_resolve_nickname, parse_hex_key_32};
 
-pub async fn cmd_key_extract(timeout_secs: u64) -> Result<(), Box<dyn std::error::Error>> {
+pub async fn cmd_key_extract(
+    timeout_secs: u64,
+    print_key: bool,
+) -> Result<(), Box<dyn std::error::Error>> {
     eprintln!("Running pre-flight checks...");
     wx_keychain::preflight_checks()?;
     eprintln!("  All checks passed.");
@@ -40,7 +43,14 @@ pub async fn cmd_key_extract(timeout_secs: u64) -> Result<(), Box<dyn std::error
     let hex_key = hex::encode(result.raw_key);
     eprintln!("Key captured after {} PBKDF2 calls.", result.call_count);
     eprintln!("Matched account: {}", matched.account_id);
-    println!("{hex_key}");
+    if print_key {
+        println!("{hex_key}");
+    } else {
+        eprintln!(
+            "Key not printed to stdout; use --print-key to show it. \
+             (Saved to the keystore below once capture finishes successfully.)"
+        );
+    }
 
     let nickname = wx_keychain::resolve_nickname(
         &matched.data_dir,

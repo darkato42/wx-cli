@@ -386,12 +386,14 @@ fn search_paging_totals_reflect_visible_set() {
     assert!(body.contains(r#""returned":1"#), "{body}");
 
     let response = http_get(&server.base_url, "/api/v1/search?q=plans&limit=1&offset=1");
+    assert_eq!(response.status_code, 200, "{response:#?}");
     let body = String::from_utf8_lossy(&response.body);
     assert!(body.contains("paging plans alpha"), "{body}");
     assert!(body.contains(r#""has_more":false"#), "{body}");
 
     // show_hidden=1 restores the full count (hidden hit included).
     let response = http_get(&server.base_url, "/api/v1/search?q=plans&show_hidden=1");
+    assert_eq!(response.status_code, 200, "{response:#?}");
     let body = String::from_utf8_lossy(&response.body);
     assert!(body.contains(r#""total":3"#), "{body}");
 }
@@ -949,13 +951,19 @@ fn create_encrypted_message_db(path: &Path, raw_key: &[u8; 32]) {
             .expect("insert video message");
 
             // Message authored by the HIDDEN_SENDER (real_sender_id 3) inside
-            // TALKER's *visible* session. Used by the search-visibility tests:
-            // the session is not hidden, but the sender is, so search hits
-            // from this message must be filtered unless show_hidden=1.
+            // GROUP_TALKER's *visible* group session. Used by the
+            // search-visibility tests: the group is not hidden, but the
+            // sender is, so search hits from this message must be filtered
+            // (group-aware sender hiding, matching
+            // VisibilityIndex::is_hidden_sender_in_group used everywhere
+            // else) unless show_hidden=1. Private (non-group) chats do NOT
+            // apply sender-level hiding — hiding a 1:1 contact hides the
+            // whole talker instead, so this fixture intentionally lives in
+            // the group table, not the private-chat table.
             conn.execute(
                 &format!(
-                    "INSERT INTO [{table}] VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
-                    table = MSG_TABLE
+                    "INSERT INTO [{group_table}] VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+                    group_table = GROUP_MSG_TABLE
                 ),
                 params![
                     600_i64,

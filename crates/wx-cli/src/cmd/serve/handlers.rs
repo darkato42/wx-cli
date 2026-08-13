@@ -692,6 +692,45 @@ pub struct SearchParams {
     show_hidden: Option<String>,
 }
 
+/// A search hit not yet resolved to display names — either from the
+/// native FTS index or from the row-scan fallback. Kept unenriched so
+/// visibility filtering and paging can run before the (comparatively
+/// expensive) display-name resolution, which should only be done for the
+/// page actually returned.
+enum RawSearchHit {
+    Native(wx_db::native_fts::NativeFtsHit),
+    Scanned(wx_db::Message, String),
+}
+
+impl RawSearchHit {
+    fn talker(&self) -> &str {
+        match self {
+            RawSearchHit::Native(hit) => &hit.talker,
+            RawSearchHit::Scanned(_, talker) => talker,
+        }
+    }
+
+    fn sender(&self) -> &str {
+        match self {
+            RawSearchHit::Native(hit) => &hit.sender,
+            RawSearchHit::Scanned(msg, _) => &msg.sender,
+        }
+    }
+
+    fn enrich(
+        self,
+        self_wxid: &str,
+        resolver: &wx_context::ContactResolver,
+    ) -> crate::schema::SearchHit {
+        match self {
+            RawSearchHit::Native(hit) => enrich_native_fts_hit(hit, self_wxid, resolver),
+            RawSearchHit::Scanned(msg, talker) => {
+                enrich_message_as_hit(msg, talker, self_wxid, resolver)
+            }
+        }
+    }
+}
+
 pub async fn handler_search(
     State(state): State<Arc<AppState>>,
     Query(params): Query<SearchParams>,
@@ -745,25 +784,30 @@ pub async fn handler_search(
                 Some(&name2id),
             ) {
                 Ok(result) => {
-                    let items: Vec<_> = result
-                        .hits
-                        .into_iter()
-                        .map(|hit| enrich_native_fts_hit(hit, &self_wxid_clone, &resolver_clone))
-                        .collect();
-                    // Contact hiding applies to search results too: drop hits
-                    // from/into hidden persons, then page the visible slice.
-                    // Filtering BEFORE limit/offset keeps total/has_more exact
-                    // for the visible set and never leaks hidden counts into
-                    // paging fields (the window is bounded by MAX_QUERY_LIMIT,
-                    // same as the timeline endpoint).
-                    let items = crate::visibility_projection::project_search_hits(
-                        items,
+                    // Contact hiding applies to search results too: filter
+                    // the RAW hits (talker/sender only, no display-name
+                    // resolution yet) before paging, then enrich only the
+                    // page that will actually be returned — enriching the
+                    // full MAX_QUERY_LIMIT window regardless of page size
+                    // would resolve up to 20k display names per request for
+                    // common search terms. Filtering before limit/offset
+                    // keeps total/has_more exact for the visible set and
+                    // never leaks hidden counts into paging fields.
+                    let visible_hits = crate::visibility_projection::project_search_hits_raw(
+                        result.hits,
                         &visibility_clone,
                         show_hidden,
+                        |hit| &hit.talker,
+                        |hit| &hit.sender,
                     );
-                    let total = items.len();
+                    let total = visible_hits.len();
                     let start = offset.min(total);
-                    let page: Vec<_> = items.into_iter().skip(start).take(limit).collect();
+                    let page: Vec<_> = visible_hits
+                        .into_iter()
+                        .skip(start)
+                        .take(limit)
+                        .map(|hit| enrich_native_fts_hit(hit, &self_wxid_clone, &resolver_clone))
+                        .collect();
                     let returned = page.len();
                     let has_more = start + returned < total;
                     Ok(JsonEnvelope {
@@ -862,21 +906,15 @@ pub async fn handler_search(
             }
         };
 
-        let (hits, _total_hits, scan_scanned, scan_skipped, shard_warnings): (
-            Vec<_>,
-            usize,
+        let (hits, scan_scanned, scan_skipped, shard_warnings): (
+            Vec<RawSearchHit>,
             usize,
             usize,
             Vec<wx_db::ShardWarning>,
         ) = match native_result {
             Some(result) => {
-                let total = result.total_hits;
-                let items = result
-                    .hits
-                    .into_iter()
-                    .map(|hit| enrich_native_fts_hit(hit, &self_wxid, &resolver))
-                    .collect();
-                (items, total, 0, 0, Vec::new())
+                let items = result.hits.into_iter().map(RawSearchHit::Native).collect();
+                (items, 0, 0, Vec::new())
             }
             None => {
                 // Scan fallback: iterate all sessions and search by keyword.
@@ -930,29 +968,36 @@ pub async fn handler_search(
                         .then_with(|| b.0.server_id.cmp(&a.0.server_id))
                 });
 
-                let total = all_hits.len();
-                let enriched: Vec<_> = all_hits
+                let items = all_hits
                     .into_iter()
-                    .map(|(m, talker)| enrich_message_as_hit(m, talker, &self_wxid, &resolver))
+                    .map(|(msg, talker)| RawSearchHit::Scanned(msg, talker))
                     .collect();
-                (
-                    enriched,
-                    total,
-                    total_scanned,
-                    total_skipped,
-                    all_shard_warnings,
-                )
+                (items, total_scanned, total_skipped, all_shard_warnings)
             }
         };
 
-        // Contact hiding applies to search results: drop hits from/into
-        // hidden persons, then page the visible slice. Filtering BEFORE
-        // limit/offset keeps total/has_more exact for the visible set.
-        let visible_hits =
-            crate::visibility_projection::project_search_hits(hits, &visibility_scan, show_hidden);
+        // Contact hiding applies to search results: filter the RAW hits
+        // (talker/sender only, no display-name resolution yet) before
+        // enriching, then enrich only the page that will actually be
+        // returned — enriching the full MAX_QUERY_LIMIT scan window
+        // regardless of page size would resolve display names for up to
+        // 20k hits per request. Filtering before limit/offset keeps
+        // total/has_more exact for the visible set.
+        let visible_hits: Vec<RawSearchHit> = crate::visibility_projection::project_search_hits_raw(
+            hits,
+            &visibility_scan,
+            show_hidden,
+            |hit| hit.talker(),
+            |hit| hit.sender(),
+        );
         let total = visible_hits.len();
         let start = offset.min(total);
-        let items: Vec<_> = visible_hits.into_iter().skip(start).take(limit).collect();
+        let items: Vec<_> = visible_hits
+            .into_iter()
+            .skip(start)
+            .take(limit)
+            .map(|hit| hit.enrich(&self_wxid, &resolver))
+            .collect();
         let returned = items.len();
         let has_more = start + returned < total;
         let envelope = JsonEnvelope {
